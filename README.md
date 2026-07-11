@@ -50,6 +50,10 @@ average stored percentiles into a new percentile.
 Rust 1.94.1 is pinned in `rust-toolchain.toml`. The Protobuf compiler is bundled
 for the build; no separate `protoc` installation is needed.
 
+Tagged Linux amd64 releases are static musl executables. The published raw
+binary, SHA-256 file, and GitHub build-provenance attestation identify the exact
+bytes intended for every observer.
+
 Set credentials in the process environment. There are intentionally no CLI
 flags for secrets, and the Quicknode tenant endpoint has no source default.
 

@@ -30,6 +30,7 @@ const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle"];
 #[derive(Debug, Parser)]
 #[command(
     name = "hyperliquid-market-benchmark",
+    version,
     about = "Continuously measure Hyperliquid event-to-canonical-book-ready latency from three matched sources"
 )]
 struct Args {

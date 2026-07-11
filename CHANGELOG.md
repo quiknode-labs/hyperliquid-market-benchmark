@@ -4,6 +4,13 @@ All notable changes to the collector and measurement contract are documented
 here. Versions follow Semantic Versioning; measurement-contract changes are
 also identified independently in emitted events.
 
+## 0.1.1 - 2026-07-11
+
+- Publish a static Linux amd64 musl artifact that does not depend on the fleet's
+  glibc version.
+- Expose `--version` so deployment can execute the artifact as its service user
+  before enabling either collector process.
+
 ## 0.1.0 - 2026-07-11
 
 - Initial public three-source Hyperliquid BBO and depth-20 L2Book benchmark.
