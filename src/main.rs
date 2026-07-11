@@ -22,6 +22,7 @@ mod streams;
 const EVENT_QUEUE_CAPACITY: usize = 16_384;
 const ROLLING_WINDOW: Duration = Duration::from_secs(300);
 const PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
+const PUBLICATION_DEADLINE: Duration = Duration::from_secs(20);
 const COHORT_TIMEOUT: Duration = Duration::from_secs(5);
 const STALE_AFTER: Duration = Duration::from_secs(60);
 const MAX_COINS_PER_PROCESS: usize = 10;
@@ -243,13 +244,18 @@ async fn main() -> Result<()> {
                 benchmark.record(event);
             }
             _ = publish.tick() => {
-                publish_window(
-                    &mut benchmark,
-                    &signals,
-                    &axiom,
-                    &ingest_health,
-                    clock_health.borrow().clone(),
-                ).await?;
+                tokio::time::timeout(
+                    PUBLICATION_DEADLINE,
+                    publish_window(
+                        &mut benchmark,
+                        &signals,
+                        &axiom,
+                        &ingest_health,
+                        clock_health.borrow().clone(),
+                    ),
+                )
+                .await
+                .context("latency-window publication exceeded its liveness deadline")??;
             }
             signal = &mut shutdown => {
                 signal?;

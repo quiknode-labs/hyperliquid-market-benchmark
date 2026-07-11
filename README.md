@@ -84,6 +84,11 @@ dataset-scoped ingest token; personal/query tokens are rejected. Persistent
 outbox data defaults to `/var/lib/hyperliquid-market-benchmark/{bbo|l2book}`.
 Use `BENCHMARK_OUTBOX_DIR` for an unprivileged local run.
 
+Each provider reconnects independently, so one unavailable source produces an
+explicit incomplete cohort without stopping the other streams. Every
+30-second window must be durably admitted within 20 seconds; if local
+publication stalls, the process exits so its service supervisor can restart it.
+
 ## Public observer identity
 
 Telemetry contains a stable public runner ID, cloud, logical comparison region,
