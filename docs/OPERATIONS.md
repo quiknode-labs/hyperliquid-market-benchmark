@@ -27,9 +27,11 @@ Required secrets:
 - `QUICKNODE_HYPERLIQUID_TOKEN`
 - `AXIOM_API_TOKEN` (dataset-scoped ingest token)
 
-Required private endpoint configuration:
+Required public Quicknode endpoint configuration:
 
-- `QUICKNODE_HYPERLIQUID_GRPC_URL`
+- `QUICKNODE_HYPERLIQUID_GRPC_URL`, an HTTPS
+  `*.hype-mainnet.quiknode.pro:10000` origin. Direct, internal, plaintext,
+  testnet, and wrong-port origins are refused.
 
 Required public observer configuration:
 

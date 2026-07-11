@@ -60,7 +60,7 @@ flags for secrets, and the Quicknode tenant endpoint has no source default.
 ```bash
 export HYDROMANCER_API_KEY='<secret>'
 export QUICKNODE_HYPERLIQUID_TOKEN='<secret>'
-export QUICKNODE_HYPERLIQUID_GRPC_URL='https://<your-endpoint>:10000'
+export QUICKNODE_HYPERLIQUID_GRPC_URL='https://your-endpoint.hype-mainnet.quiknode.pro:10000'
 export AXIOM_API_TOKEN='<dataset-ingest-token>'
 
 export BENCHMARK_RUNNER_ID='aws-nrt-01'

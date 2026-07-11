@@ -471,9 +471,8 @@ impl Benchmark {
                 .all(|provider| signals.snapshot(*provider, coin).connection_up);
             let cohort_messages_fresh = PROVIDERS.iter().all(|provider| {
                 let last_message = signals.snapshot(*provider, coin).last_message_wall_ms;
-                last_message > 0
-                    && last_message <= actual_wall_ms
-                    && actual_wall_ms - last_message <= self.config.stale_after.as_millis() as u64
+                stream_message_age_ms(actual_wall_ms, last_message)
+                    .is_some_and(|age| age <= self.config.stale_after.as_millis() as u64)
             });
             let cohort_health_complete = integrity_complete
                 && cohort_connections_live
@@ -490,9 +489,8 @@ impl Benchmark {
                 let summary = distribution(values);
                 let latest = window.cohorts.back();
                 let stream = signals.snapshot(provider, coin);
-                let last_message_age_ms = (stream.last_message_wall_ms > 0
-                    && stream.last_message_wall_ms <= actual_wall_ms)
-                    .then(|| actual_wall_ms - stream.last_message_wall_ms);
+                let last_message_age_ms =
+                    stream_message_age_ms(actual_wall_ms, stream.last_message_wall_ms);
                 let fresh = last_message_age_ms
                     .is_some_and(|age| age <= self.config.stale_after.as_millis() as u64);
                 let enough_samples = sample_count >= MIN_READY_SAMPLES as u64;
@@ -1110,6 +1108,10 @@ fn aligned_window_end_ms(time: SystemTime, interval: Duration) -> u64 {
     now_ms - now_ms % interval_ms
 }
 
+fn stream_message_age_ms(reference_wall_ms: u64, message_wall_ms: u64) -> Option<u64> {
+    (message_wall_ms > 0).then(|| reference_wall_ms.saturating_sub(message_wall_ms))
+}
+
 fn format_time(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -1239,6 +1241,61 @@ mod tests {
             events
                 .iter()
                 .all(|event| event.ingest_last_success_age_ms == Some(29_999))
+        );
+    }
+
+    #[test]
+    fn concurrently_newer_stream_snapshots_are_fresh_with_zero_age() {
+        let now = Instant::now();
+        let (mut benchmark, signals) = config(now);
+        for provider in PROVIDERS {
+            benchmark.record(book(provider, 1_000, 1_100, now, "100"));
+        }
+        settle_pending(&mut benchmark, now);
+
+        signals.set_test_state(Provider::FoundationWs, "BTC", true, 29_999, 0);
+        signals.set_test_state(Provider::HydromancerWs, "BTC", true, 30_002, 0);
+        signals.set_test_state(Provider::QuickNodeGrpc, "BTC", true, 30_011, 0);
+
+        let events = benchmark.window_events(
+            now + Duration::from_secs(2),
+            UNIX_EPOCH + Duration::from_millis(30_000),
+            &signals,
+            IngestHealthSnapshot::default(),
+            healthy_clock(30_000),
+        );
+
+        assert_eq!(events.len(), PROVIDERS.len());
+        assert!(events.iter().all(|event| {
+            event.cohort_complete
+                && !event.ready
+                && event.readiness == "warming-up"
+                && event.sample_count == 1
+                && event.min_ready_samples == MIN_READY_SAMPLES as u64
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.provider == "hyperliquid")
+                .unwrap()
+                .last_message_age_ms,
+            Some(1)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.provider == "hydromancer")
+                .unwrap()
+                .last_message_age_ms,
+            Some(0)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.provider == "quicknode")
+                .unwrap()
+                .last_message_age_ms,
+            Some(0)
         );
     }
 

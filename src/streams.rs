@@ -623,8 +623,24 @@ fn validate_grpc_endpoint(endpoint: &str) -> Result<String> {
             "Quicknode gRPC endpoint must be an origin without a path, query, or fragment"
         );
     }
-    if url.scheme() == "http" && !url.host_str().is_some_and(is_loopback_host) {
-        anyhow::bail!("Quicknode gRPC endpoint must use HTTPS except on loopback");
+    if url.scheme() != "https" {
+        anyhow::bail!("Quicknode gRPC endpoint must use HTTPS");
+    }
+    let host = url.host_str().expect("host checked above");
+    let endpoint_name = host
+        .strip_suffix(".hype-mainnet.quiknode.pro")
+        .filter(|name| {
+            !name.is_empty()
+                && !name.starts_with('-')
+                && !name.ends_with('-')
+                && name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        });
+    if endpoint_name.is_none() || url.port() != Some(10_000) {
+        anyhow::bail!(
+            "Quicknode gRPC endpoint must be a public *.hype-mainnet.quiknode.pro origin on port 10000"
+        );
     }
     Ok(normalized)
 }
@@ -1047,19 +1063,42 @@ mod tests {
     }
 
     #[test]
-    fn grpc_endpoint_defaults_to_tls_but_allows_explicit_local_http() {
+    fn grpc_endpoint_requires_the_public_quicknode_mainnet_origin() {
         assert_eq!(
-            normalize_grpc_endpoint("example.com:10000"),
-            "https://example.com:10000"
+            normalize_grpc_endpoint("example-guide-demo.hype-mainnet.quiknode.pro:10000"),
+            "https://example-guide-demo.hype-mainnet.quiknode.pro:10000"
         );
-        assert_eq!(
-            normalize_grpc_endpoint("http://127.0.0.1:10000"),
-            "http://127.0.0.1:10000"
+        assert!(
+            validate_grpc_endpoint("https://example-guide-demo.hype-mainnet.quiknode.pro:10000")
+                .is_ok()
         );
-        assert!(validate_grpc_endpoint("https://example.com:10000").is_ok());
-        assert!(validate_grpc_endpoint("https://user:secret@example.com:10000").is_err());
-        assert!(validate_grpc_endpoint("https://example.com:10000/token").is_err());
-        assert!(validate_grpc_endpoint("https://example.com:10000?token=secret").is_err());
+        assert!(
+            validate_grpc_endpoint(
+                "https://user:secret@example-guide-demo.hype-mainnet.quiknode.pro:10000"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_grpc_endpoint(
+                "https://example-guide-demo.hype-mainnet.quiknode.pro:10000/token"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_grpc_endpoint(
+                "https://example-guide-demo.hype-mainnet.quiknode.pro:10000?token=secret"
+            )
+            .is_err()
+        );
+        assert!(validate_grpc_endpoint("https://internal.example:10000").is_err());
+        assert!(
+            validate_grpc_endpoint("https://example-guide-demo.hype-mainnet.quiknode.pro:443")
+                .is_err()
+        );
+        assert!(
+            validate_grpc_endpoint("https://example-guide-demo.hype-testnet.quiknode.pro:10000")
+                .is_err()
+        );
     }
 
     #[test]

@@ -4,6 +4,15 @@ All notable changes to the collector and measurement contract are documented
 here. Versions follow Semantic Versioning; measurement-contract changes are
 also identified independently in emitted events.
 
+## 0.1.2 - 2026-07-11
+
+- Treat a stream message observed a few milliseconds after the publication
+  clock snapshot as age zero, eliminating false freshness gaps at aligned
+  30-second boundaries.
+- Refuse direct, internal, testnet, wrong-port, or plaintext gRPC origins. The
+  Quicknode source now accepts only a public mainnet
+  `*.hype-mainnet.quiknode.pro:10000` endpoint over HTTPS.
+
 ## 0.1.1 - 2026-07-11
 
 - Publish a static Linux amd64 musl artifact that does not depend on the fleet's
