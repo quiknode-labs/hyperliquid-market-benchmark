@@ -17,9 +17,9 @@
   milliseconds. Legitimate equal minima are reported as ties.
 - Runtime clock gating reduces observer-clock error; it cannot prove that every
   upstream event timestamp is correct.
-- Axiom delivery is at least once. Public consumers must collapse identical
-  deterministic event IDs and reject an ID whose payload has conflicting
-  variants before aggregating data.
+- Axiom delivery is at least once. Public consumers must collapse equivalent
+  deterministic event IDs and reject an ID whose eligibility- or output-relevant
+  fields have conflicting variants before aggregating data.
 - Cash-market overlays are contextual annotations. They do not establish that a
   market open caused a latency change. Holidays and half days require a separate
   verified calendar and are not inferred from weekday templates.

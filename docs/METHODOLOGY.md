@@ -113,10 +113,11 @@ never posted again: local unlink or directory-fsync cleanup is retried locally.
 
 Delivery is deliberately at least once. A partial acknowledgement or a lost
 response can cause a complete immutable batch to be posted again. `event_id` is
-deterministic for measurement schema, run, window, and provider, so a replay has
-the same identity and payload. Consumers collapse byte-equivalent retries,
-reject conflicting duplicate identities, and reject ambiguous same-timestamp
-windows before any percentile or outcome is displayed.
+deterministic for measurement schema, run, window, and provider, so a normal
+replay has the same identity and payload. Consumers compare every field that can
+affect eligibility or rendered output, collapse equivalent retries, reject a
+duplicate identity that conflicts on any of those fields, and reject ambiguous
+same-timestamp windows before any percentile or outcome is displayed.
 
 ## Provenance
 
