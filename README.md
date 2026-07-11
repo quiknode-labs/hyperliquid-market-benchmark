@@ -20,8 +20,9 @@ validation, numeric normalization, and canonical book construction have all
 completed. A book is admitted only when all three paths produced the same
 canonical content for the same coin and event timestamp.
 
-The [public dashboard](https://quicknode.com/hyperliquid-markets) is designed
-for provider evaluation. This repository is
+The [deployed dashboard](https://hyperliquid-markets.quicknode.workers.dev/hyperliquid-markets)
+is designed for provider evaluation. The intended branded route is
+`https://quicknode.com/hyperliquid-markets`. This repository is
 the auditable producer behind that data. Start with
 [the methodology](docs/METHODOLOGY.md) and
 [the limitations](docs/LIMITATIONS.md) before interpreting a chart.
