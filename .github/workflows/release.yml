@@ -1,0 +1,78 @@
+name: Release Linux amd64 collector
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  BENCHMARK_SOURCE_COMMIT: ${{ github.sha }}
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the tagged revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          rustup default 1.94.1
+
+      - name: Verify and build
+        run: |
+          ./scripts/check-public-surface.sh
+          cargo fmt --all --check
+          cargo test --all-targets --locked
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo build --release --locked
+
+      - name: Package the collector and disclosures
+        run: |
+          install -d dist/package/hyperliquid-market-benchmark-linux-amd64
+          install -m 0755 target/release/hyperliquid-market-benchmark dist/hyperliquid-market-benchmark-linux-amd64
+          install -m 0755 target/release/hyperliquid-market-benchmark dist/package/hyperliquid-market-benchmark-linux-amd64/
+          install -m 0644 LICENSE README.md dist/package/hyperliquid-market-benchmark-linux-amd64/
+          cp -R docs dist/package/hyperliquid-market-benchmark-linux-amd64/
+          tar -C dist/package -czf dist/hyperliquid-market-benchmark-linux-amd64.tar.gz hyperliquid-market-benchmark-linux-amd64
+          sha256sum dist/hyperliquid-market-benchmark-linux-amd64 > dist/hyperliquid-market-benchmark-linux-amd64.sha256
+          sha256sum dist/hyperliquid-market-benchmark-linux-amd64.tar.gz > dist/hyperliquid-market-benchmark-linux-amd64.tar.gz.sha256
+
+      - name: Attest release provenance
+        uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999 # v4
+        with:
+          subject-path: |
+            dist/hyperliquid-market-benchmark-linux-amd64
+            dist/hyperliquid-market-benchmark-linux-amd64.sha256
+            dist/hyperliquid-market-benchmark-linux-amd64.tar.gz
+            dist/hyperliquid-market-benchmark-linux-amd64.tar.gz.sha256
+
+      - name: Upload immutable workflow artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hyperliquid-market-benchmark-linux-amd64
+          path: |
+            dist/hyperliquid-market-benchmark-linux-amd64
+            dist/hyperliquid-market-benchmark-linux-amd64.sha256
+            dist/hyperliquid-market-benchmark-linux-amd64.tar.gz
+            dist/hyperliquid-market-benchmark-linux-amd64.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/hyperliquid-market-benchmark-linux-amd64 \
+            dist/hyperliquid-market-benchmark-linux-amd64.sha256 \
+            dist/hyperliquid-market-benchmark-linux-amd64.tar.gz \
+            dist/hyperliquid-market-benchmark-linux-amd64.tar.gz.sha256 \
+            --verify-tag --generate-notes --title "$GITHUB_REF_NAME"

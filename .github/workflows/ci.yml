@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  BENCHMARK_SOURCE_COMMIT: ${{ github.sha }}
+
+jobs:
+  correctness:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal --component clippy,rustfmt
+          rustup default 1.94.1
+
+      - name: Reject private deployment material
+        run: ./scripts/check-public-surface.sh
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Test every target with the locked graph
+        run: cargo test --all-targets --locked
+
+      - name: Deny compiler and Clippy warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Build the release binary
+        run: cargo build --release --locked
