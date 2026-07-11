@@ -52,8 +52,8 @@ jobs:
           install -m 0644 LICENSE README.md dist/package/hyperliquid-market-benchmark-linux-amd64/
           cp -R docs dist/package/hyperliquid-market-benchmark-linux-amd64/
           tar -C dist/package -czf dist/hyperliquid-market-benchmark-linux-amd64.tar.gz hyperliquid-market-benchmark-linux-amd64
-          sha256sum dist/hyperliquid-market-benchmark-linux-amd64 > dist/hyperliquid-market-benchmark-linux-amd64.sha256
-          sha256sum dist/hyperliquid-market-benchmark-linux-amd64.tar.gz > dist/hyperliquid-market-benchmark-linux-amd64.tar.gz.sha256
+          (cd dist && sha256sum hyperliquid-market-benchmark-linux-amd64 > hyperliquid-market-benchmark-linux-amd64.sha256)
+          (cd dist && sha256sum hyperliquid-market-benchmark-linux-amd64.tar.gz > hyperliquid-market-benchmark-linux-amd64.tar.gz.sha256)
 
       - name: Attest release provenance
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4
