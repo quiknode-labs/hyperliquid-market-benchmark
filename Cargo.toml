@@ -6,7 +6,7 @@ rust-version = "1.94"
 description = "Transparent three-source Hyperliquid canonical-book-ready latency benchmark"
 license = "Apache-2.0"
 repository = "https://github.com/quiknode-labs/hyperliquid-market-benchmark"
-homepage = "https://quicknode.com/hyperliquid-markets"
+homepage = "https://hyperliquid-market-benchmark-web.quicknode.workers.dev"
 readme = "README.md"
 publish = false
 
