@@ -1,5 +1,7 @@
 # Hyperliquid market benchmark
 
+## What this is
+
 A continuous, open-source latency observer for Hyperliquid BBO and depth-20
 L2Book data. It compares three currently available paths on the same exact book
 events:
@@ -26,7 +28,7 @@ behind that data. Start with
 [the methodology](docs/METHODOLOGY.md) and
 [the limitations](docs/LIMITATIONS.md) before interpreting a chart.
 
-## What is published
+## What is measured
 
 Every process maintains an exact five-minute ring of complete three-source
 cohorts and publishes one logical three-row Axiom window every 30 seconds.
@@ -45,7 +47,33 @@ These scopes are deliberately different:
 The dashboard does not relabel a five-minute P99 as a one-hour P99 and does not
 average stored percentiles into a new percentile.
 
-## Run locally
+## Honesty rules this codebase enforces
+
+- A latency enters the comparison only when all three sources produced the same
+  canonical content for the same event.
+- P50, P95, and P99 are exact nearest-rank values over the collector's raw
+  five-minute sample ring; the dashboard never averages stored percentiles.
+- Missing, late, stale, or integrity-invalid data remains an explicit gap.
+- Below-threshold P99 is visible and labeled warming rather than hidden or ranked
+  as equally trustworthy.
+- Clock health, source commit, and artifact digest travel with every trustworthy
+  window.
+
+## Repository layout
+
+This is the public benchmark source repository. The branded dashboard lives in
+the private `hyperliquid-market-benchmark-web` repository, and shared inventory
+plus both product playbooks live in private `benchmark-fleet-ops`.
+
+```text
+src/       Rust collector, providers, cohort admission, rollups, and outbox
+proto/     Quicknode Hyperliquid gRPC contract used by the collector
+docs/      methodology, limitations, operations, and data dictionary
+scripts/   public-surface and release checks
+.github/   release, provenance, dependency, and public-surface workflows
+```
+
+## Quick start
 
 Rust 1.94.1 is pinned in `rust-toolchain.toml`. The Protobuf compiler is bundled
 for the build; no separate `protoc` installation is needed.
@@ -53,6 +81,8 @@ for the build; no separate `protoc` installation is needed.
 Tagged Linux amd64 releases are static musl executables. The published raw
 binary, SHA-256 file, and GitHub build-provenance attestation identify the exact
 bytes intended for every observer.
+
+### Credentials
 
 Set credentials in the process environment. There are intentionally no CLI
 flags for secrets, and the Quicknode tenant endpoint has no source default.
@@ -69,6 +99,8 @@ export BENCHMARK_REGION='nrt'
 export BENCHMARK_METRO='nrt'
 export BENCHMARK_SOURCE_COMMIT="$(git rev-parse HEAD)"
 ```
+
+### Run
 
 Run BBO and L2Book in separate processes so their load and failure state remain
 isolated:
@@ -104,7 +136,7 @@ The current fleet contains AWS, GCP, and Oracle observers in five logical
 regions. Adding a future source requires a measurement-version change rather
 than a hidden compatibility path.
 
-## Reproduce the checks
+## Checks
 
 ```bash
 cargo fmt --all --check
@@ -112,8 +144,12 @@ cargo test --all-targets --locked
 cargo clippy --all-targets --locked -- -D warnings
 ```
 
-See [operations](docs/OPERATIONS.md) for runtime clock and canary checks and
-[the data dictionary](docs/DATA_DICTIONARY.md) for the complete event contract.
+## Documentation
+
+- [Methodology](docs/METHODOLOGY.md)
+- [Limitations](docs/LIMITATIONS.md)
+- [Operations](docs/OPERATIONS.md)
+- [Data dictionary](docs/DATA_DICTIONARY.md)
 
 ## License
 
