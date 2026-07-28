@@ -2,6 +2,11 @@ syntax = "proto3";
 
 package hyperliquid;
 
+// Generic customer stream used for raw HyperCore fills.
+service Streaming {
+  rpc StreamData(stream SubscribeRequest) returns (stream SubscribeUpdate);
+}
+
 // Minimal public client contract used by the benchmark. Field numbers and RPC
 // paths match the production Quicknode Hyperliquid order-book service.
 service OrderBookStreaming {
@@ -40,4 +45,58 @@ message BboBookUpdate {
   uint64 block_number = 3;
   optional L2Level bid = 4;
   optional L2Level ask = 5;
+}
+
+message SubscribeRequest {
+  oneof request {
+    StreamSubscribe subscribe = 1;
+    Ping ping = 3;
+  }
+  reserved 2;
+}
+
+message StreamSubscribe {
+  StreamType stream_type = 1;
+  uint64 start_block = 2;
+  map<string, FilterValues> filters = 3;
+  string filter_name = 4;
+}
+
+message FilterValues {
+  repeated string values = 1;
+}
+
+message Ping {
+  int64 timestamp = 1;
+}
+
+message SubscribeUpdate {
+  oneof update {
+    StreamResponse data = 1;
+    Pong pong = 2;
+  }
+}
+
+message StreamResponse {
+  uint64 block_number = 1;
+  uint64 timestamp = 2;
+  string data = 3;
+}
+
+message Pong {
+  int64 timestamp = 1;
+}
+
+enum StreamType {
+  UNKNOWN = 0;
+  TRADES = 1;
+  ORDERS = 2;
+  BOOK_UPDATES = 3;
+  TWAP = 4;
+  EVENTS = 5;
+  BLOCKS = 6;
+  WRITER_ACTIONS = 7;
+  MEMPOOL_TXS = 8;
+  ORDER_PRIORITY = 9;
+  GOSSIP_PRIORITY = 10;
 }

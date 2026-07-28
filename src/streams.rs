@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -6,7 +7,9 @@ use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tonic::metadata::MetadataValue;
@@ -14,9 +17,13 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tracing::{debug, warn};
 
 use crate::grpc::pb::order_book_streaming_client::OrderBookStreamingClient;
-use crate::grpc::pb::{BboBookRequest, L2BookRequest};
+use crate::grpc::pb::streaming_client::StreamingClient;
+use crate::grpc::pb::{
+    BboBookRequest, FilterValues, L2BookRequest, Ping, StreamSubscribe, StreamType,
+    SubscribeRequest,
+};
 use crate::model::{
-    BookEvent, BookKey, Dataset, EventKey, LevelKey, ProbeEvent, ProbeSender, Provider,
+    ContentKey, Dataset, EventKey, LevelKey, MarketEvent, ProbeEvent, ProbeSender, Provider,
 };
 
 const L2_BOOK_DEPTH: u32 = 20;
@@ -27,6 +34,7 @@ const WS_HEARTBEAT: Duration = Duration::from_secs(20);
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 1024 * 1024;
+const MAX_FILL_GRPC_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct StreamConfig {
@@ -40,7 +48,7 @@ pub struct StreamConfig {
 }
 
 pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandle<()>> {
-    let mut tasks = Vec::with_capacity(config.coins.len() * 3);
+    let mut tasks = Vec::with_capacity(config.coins.len() * config.dataset.providers().len());
     for coin in config.coins.clone() {
         tasks.push(tokio::spawn(run_foundation(
             config.foundation_ws.clone(),
@@ -48,13 +56,19 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
             config.dataset,
             sender.clone(),
         )));
-        tasks.push(tokio::spawn(run_hydromancer(
-            config.hydromancer_ws.clone(),
-            config.hydromancer_token.clone(),
-            coin.clone(),
-            config.dataset,
-            sender.clone(),
-        )));
+        if config
+            .dataset
+            .providers()
+            .contains(&Provider::HydromancerWs)
+        {
+            tasks.push(tokio::spawn(run_hydromancer(
+                config.hydromancer_ws.clone(),
+                config.hydromancer_token.clone(),
+                coin.clone(),
+                config.dataset,
+                sender.clone(),
+            )));
+        }
         tasks.push(tokio::spawn(run_quicknode(
             config.quicknode_grpc.clone(),
             config.quicknode_token.clone(),
@@ -260,23 +274,32 @@ async fn run_foundation_once(
                 if frame.channel.as_deref() == Some("error") {
                     anyhow::bail!("Foundation rejected the {} subscription", dataset.label());
                 }
-                let Some(parsed) = parse_ws_book(frame, dataset) else {
-                    debug!("ignoring non-book Foundation message");
-                    continue;
+                let parsed_events = if dataset == Dataset::Fills {
+                    parse_ws_trades(frame)
+                } else {
+                    parse_ws_book(frame, dataset)
+                        .map(|parsed| vec![parsed.key])
+                        .unwrap_or_default()
                 };
-                if parsed.key.coin != coin {
-                    warn!(expected = coin, actual = parsed.key.coin, "ignoring Foundation update for unexpected coin");
+                if parsed_events.is_empty() {
+                    debug!("ignoring non-benchmark Foundation message");
                     continue;
                 }
                 let received = Instant::now();
                 let received_wall_ms = now_ms();
-                if !sender.send(ProbeEvent::Book(BookEvent {
-                    provider: Provider::FoundationWs,
-                    key: parsed.key,
-                    received,
-                    received_wall_ms,
-                })).await {
-                    return Ok(());
+                for key in parsed_events {
+                    if key.coin != coin {
+                        warn!(expected = coin, actual = key.coin, "ignoring Foundation update for unexpected coin");
+                        continue;
+                    }
+                    if !sender.send(ProbeEvent::Market(MarketEvent {
+                        provider: Provider::FoundationWs,
+                        key,
+                        received,
+                        received_wall_ms,
+                    })).await {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -423,7 +446,7 @@ async fn run_hydromancer_once(
                     }
                     continue;
                 }
-                if !sender.send(ProbeEvent::Book(BookEvent {
+                if !sender.send(ProbeEvent::Market(MarketEvent {
                     provider: Provider::HydromancerWs,
                     key,
                     received,
@@ -447,7 +470,7 @@ async fn run_quicknode_once(
     sender: &ProbeSender,
 ) -> Result<()> {
     let channel = grpc_channel(endpoint).await?;
-    let mut client = OrderBookStreamingClient::new(channel)
+    let mut client = OrderBookStreamingClient::new(channel.clone())
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(64 * 1024);
 
@@ -489,12 +512,12 @@ async fn run_quicknode_once(
                 let key = EventKey {
                     coin: update.coin,
                     event_ms: update.time,
-                    book: BookKey::Bbo { bid, ask },
+                    content: ContentKey::Bbo { bid, ask },
                 };
                 let received = Instant::now();
                 let received_wall_ms = now_ms();
                 if !sender
-                    .send(ProbeEvent::Book(BookEvent {
+                    .send(ProbeEvent::Market(MarketEvent {
                         provider: Provider::QuickNodeGrpc,
                         key,
                         received,
@@ -554,12 +577,12 @@ async fn run_quicknode_once(
                 let key = EventKey {
                     coin: update.coin,
                     event_ms: update.time,
-                    book: BookKey::L2 { bids, asks },
+                    content: ContentKey::L2 { bids, asks },
                 };
                 let received = Instant::now();
                 let received_wall_ms = now_ms();
                 if !sender
-                    .send(ProbeEvent::Book(BookEvent {
+                    .send(ProbeEvent::Market(MarketEvent {
                         provider: Provider::QuickNodeGrpc,
                         key,
                         received,
@@ -568,6 +591,90 @@ async fn run_quicknode_once(
                     .await
                 {
                     return Ok(());
+                }
+            }
+        }
+        Dataset::Fills => {
+            let mut client = StreamingClient::new(channel)
+                .max_decoding_message_size(MAX_FILL_GRPC_MESSAGE_BYTES)
+                .max_encoding_message_size(64 * 1024);
+            let (request_tx, request_rx) = mpsc::channel(4);
+            request_tx
+                .send(SubscribeRequest {
+                    request: Some(crate::grpc::pb::subscribe_request::Request::Subscribe(
+                        StreamSubscribe {
+                            stream_type: StreamType::Trades as i32,
+                            start_block: 0,
+                            filters: HashMap::from([(
+                                "coin".to_owned(),
+                                FilterValues {
+                                    values: vec![coin.to_owned()],
+                                },
+                            )]),
+                            filter_name: format!("benchmark-fills-{coin}"),
+                        },
+                    )),
+                })
+                .await
+                .context("queue Quicknode fills subscription")?;
+            let mut request = tonic::Request::new(ReceiverStream::new(request_rx));
+            request
+                .metadata_mut()
+                .insert("x-token", MetadataValue::try_from(token)?);
+            let mut stream = client.stream_data(request).await?.into_inner();
+            let _connection = sender.connected(Provider::QuickNodeGrpc, coin);
+            let mut heartbeat = heartbeat_interval();
+
+            loop {
+                tokio::select! {
+                    update = stream.message() => {
+                        let Some(update) = update
+                            .context("Quicknode fills gRPC stream failed")?
+                        else {
+                            break;
+                        };
+                        let Some(crate::grpc::pb::subscribe_update::Update::Data(data)) =
+                            update.update
+                        else {
+                            continue;
+                        };
+                        let events = parse_quicknode_fill_batch(&data.data);
+                        if events.is_empty() {
+                            continue;
+                        }
+                        // One receipt boundary covers the fully decoded and canonicalized
+                        // block payload. Matching and publication happen after this point.
+                        let received = Instant::now();
+                        let received_wall_ms = now_ms();
+                        for key in events {
+                            if key.coin != coin {
+                                continue;
+                            }
+                            if !sender
+                                .send(ProbeEvent::Market(MarketEvent {
+                                    provider: Provider::QuickNodeGrpc,
+                                    key,
+                                    received,
+                                    received_wall_ms,
+                                }))
+                                .await
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    _ = heartbeat.tick() => {
+                        request_tx
+                            .send(SubscribeRequest {
+                                request: Some(
+                                    crate::grpc::pb::subscribe_request::Request::Ping(Ping {
+                                        timestamp: chrono::Utc::now().timestamp_millis(),
+                                    }),
+                                ),
+                            })
+                            .await
+                            .context("send Quicknode fills heartbeat")?;
+                    }
                 }
             }
         }
@@ -673,6 +780,13 @@ fn websocket_subscription(
             "method": "subscribe",
             "subscription": {"type": "l2Book", "coin": coin},
         }),
+        (Dataset::Fills, WsSubscriptionMode::Standard) => serde_json::json!({
+            "method": "subscribe",
+            "subscription": {"type": "trades", "coin": coin},
+        }),
+        (Dataset::Fills, WsSubscriptionMode::Hydromancer) => {
+            unreachable!("fills do not use a Hydromancer comparison stream")
+        }
     }
 }
 
@@ -775,6 +889,38 @@ struct WsL2Data {
 }
 
 #[derive(Debug, Deserialize)]
+struct WsTrade {
+    coin: String,
+    side: String,
+    px: String,
+    sz: String,
+    hash: String,
+    time: u64,
+    tid: u64,
+    users: [String; 2],
+}
+
+#[derive(Debug, Deserialize)]
+struct QuickNodeFillBatch {
+    events: Vec<(String, QuickNodeFill)>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct QuickNodeFill {
+    coin: String,
+    px: String,
+    sz: String,
+    side: String,
+    time: u64,
+    hash: String,
+    crossed: bool,
+    tid: u64,
+}
+
+type QuickNodeFillPair = [Option<(String, QuickNodeFill)>; 2];
+
+#[derive(Debug, Deserialize)]
 struct WsLevel {
     px: String,
     sz: String,
@@ -817,7 +963,7 @@ fn parse_ws_book(frame: WsFrame, dataset: Dataset) -> Option<ParsedWsBook> {
             EventKey {
                 coin: data.coin,
                 event_ms: data.time,
-                book: BookKey::Bbo { bid, ask },
+                content: ContentKey::Bbo { bid, ask },
             }
         }
         Dataset::L2book => {
@@ -853,15 +999,134 @@ fn parse_ws_book(frame: WsFrame, dataset: Dataset) -> Option<ParsedWsBook> {
             EventKey {
                 coin: data.coin,
                 event_ms: data.time,
-                book: BookKey::L2 { bids, asks },
+                content: ContentKey::L2 { bids, asks },
             }
         }
+        Dataset::Fills => return None,
     };
     Some(ParsedWsBook {
         key,
         seq: frame.seq,
         cursor: frame.cursor,
     })
+}
+
+fn parse_ws_trades(frame: WsFrame) -> Vec<EventKey> {
+    if frame.channel.as_deref() != Some(Dataset::Fills.channel()) {
+        return Vec::new();
+    }
+    let Some(data) = frame.data else {
+        return Vec::new();
+    };
+    let Ok(trades) = serde_json::from_value::<Vec<WsTrade>>(data) else {
+        return Vec::new();
+    };
+    trades.into_iter().filter_map(canonical_ws_trade).collect()
+}
+
+fn canonical_ws_trade(trade: WsTrade) -> Option<EventKey> {
+    canonical_trade(
+        trade.coin,
+        trade.side,
+        trade.px,
+        trade.sz,
+        trade.hash,
+        trade.time,
+        trade.tid,
+        trade.users,
+    )
+}
+
+fn parse_quicknode_fill_batch(payload: &str) -> Vec<EventKey> {
+    let Ok(batch) = serde_json::from_str::<QuickNodeFillBatch>(payload) else {
+        return Vec::new();
+    };
+    let mut pairs: HashMap<(String, u64, u64), QuickNodeFillPair> = HashMap::new();
+    for (user, fill) in batch.events {
+        let side_index = match fill.side.as_str() {
+            "A" => 0,
+            "B" => 1,
+            _ => continue,
+        };
+        let key = (fill.coin.clone(), fill.time, fill.tid);
+        let pair = pairs.entry(key).or_insert_with(|| [None, None]);
+        if pair[side_index].is_none() {
+            pair[side_index] = Some((user, fill));
+        }
+    }
+
+    pairs
+        .into_values()
+        .filter_map(|[ask, bid]| {
+            let (seller, ask) = ask?;
+            let (buyer, bid) = bid?;
+            let ask_px = canonical_positive_decimal(ask.px)?;
+            let bid_px = canonical_positive_decimal(bid.px)?;
+            let ask_sz = canonical_positive_decimal(ask.sz)?;
+            let bid_sz = canonical_positive_decimal(bid.sz)?;
+            if ask.coin != bid.coin
+                || ask.time != bid.time
+                || ask.tid != bid.tid
+                || ask_px != bid_px
+                || ask_sz != bid_sz
+                || !ask.hash.eq_ignore_ascii_case(&bid.hash)
+                || ask.crossed == bid.crossed
+            {
+                return None;
+            }
+            let side = if ask.crossed { "A" } else { "B" }.to_owned();
+            canonical_trade(
+                ask.coin,
+                side,
+                ask_px,
+                ask_sz,
+                ask.hash,
+                ask.time,
+                ask.tid,
+                [buyer, seller],
+            )
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn canonical_trade(
+    coin: String,
+    side: String,
+    px: String,
+    sz: String,
+    hash: String,
+    time: u64,
+    tid: u64,
+    users: [String; 2],
+) -> Option<EventKey> {
+    if coin.is_empty()
+        || !matches!(side.as_str(), "A" | "B")
+        || hash.is_empty()
+        || time == 0
+        || users.iter().any(String::is_empty)
+    {
+        return None;
+    }
+    let px = canonical_positive_decimal(px)?;
+    let sz = canonical_positive_decimal(sz)?;
+    Some(EventKey {
+        coin,
+        event_ms: time,
+        content: ContentKey::Trade {
+            tid,
+            side,
+            px,
+            sz,
+            hash: hash.to_ascii_lowercase(),
+            users: users.map(|user| user.to_ascii_lowercase()),
+        },
+    })
+}
+
+fn canonical_positive_decimal(value: String) -> Option<String> {
+    let value = Decimal::from_str(&value).ok()?;
+    (value > Decimal::ZERO).then(|| value.normalize().to_string())
 }
 
 fn canonical_level(px: String, sz: String, n: u32) -> Option<(LevelKey, Decimal)> {
@@ -955,8 +1220,8 @@ mod tests {
         let parsed = parse_ws_book(frame, Dataset::Bbo).unwrap();
         assert_eq!(parsed.key.event_ms, 42);
         assert_eq!(
-            parsed.key.book,
-            BookKey::Bbo {
+            parsed.key.content,
+            ContentKey::Bbo {
                 bid: Some(LevelKey {
                     px: "100".to_owned(),
                     sz: "2".to_owned(),
@@ -977,6 +1242,46 @@ mod tests {
     }
 
     #[test]
+    fn quicknode_fill_pairs_and_foundation_trades_share_one_canonical_key() {
+        let foundation = parse_ws_trades(
+            parse_ws_frame(
+                r#"{"channel":"trades","data":[{"coin":"BTC","side":"A","px":"100.00","sz":"2.0","hash":"0xABC","time":42,"tid":7,"users":["0xBUYER","0xSELLER"]}]}"#,
+            )
+            .unwrap(),
+        );
+        let quicknode = parse_quicknode_fill_batch(
+            r#"{"local_time":"1970-01-01T00:00:00.100","block_time":"1970-01-01T00:00:00.042","block_number":1,"events":[["0xSELLER",{"coin":"BTC","px":"100.0","sz":"2.00","side":"A","time":42,"hash":"0xabc","crossed":true,"tid":7}],["0xBUYER",{"coin":"BTC","px":"100.0","sz":"2.00","side":"B","time":42,"hash":"0xABC","crossed":false,"tid":7}]]}"#,
+        );
+
+        assert_eq!(foundation, quicknode);
+        assert_eq!(foundation.len(), 1);
+        assert_eq!(
+            foundation[0].content,
+            ContentKey::Trade {
+                tid: 7,
+                side: "A".to_owned(),
+                px: "100".to_owned(),
+                sz: "2".to_owned(),
+                hash: "0xabc".to_owned(),
+                users: ["0xbuyer".to_owned(), "0xseller".to_owned()],
+            }
+        );
+        assert_eq!(foundation[0].base().trade_id, Some(7));
+    }
+
+    #[test]
+    fn fills_subscription_is_public_trades_and_has_two_expected_sources() {
+        let subscription =
+            websocket_subscription(Dataset::Fills, "BTC", WsSubscriptionMode::Standard);
+        assert_eq!(subscription["subscription"]["type"], "trades");
+        assert_eq!(subscription["subscription"]["coin"], "BTC");
+        assert_eq!(
+            Dataset::Fills.providers(),
+            &[Provider::FoundationWs, Provider::QuickNodeGrpc]
+        );
+    }
+
+    #[test]
     fn parses_exactly_twenty_l2_levels_and_rejects_short_books() {
         let bids = (81..=100)
             .rev()
@@ -994,7 +1299,7 @@ mod tests {
             Dataset::L2book,
         )
         .unwrap();
-        let BookKey::L2 { bids, asks } = parsed.key.book else {
+        let ContentKey::L2 { bids, asks } = parsed.key.content else {
             panic!("expected L2 book");
         };
         assert_eq!(bids.len(), L2_BOOK_DEPTH as usize);

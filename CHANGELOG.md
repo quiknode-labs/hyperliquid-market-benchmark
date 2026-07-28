@@ -4,6 +4,18 @@ All notable changes to the collector and measurement contract are documented
 here. Versions follow Semantic Versioning; measurement-contract changes are
 also identified independently in emitted events.
 
+## 0.2.0 - 2026-07-28
+
+- Add the `fills` dataset as an exact two-source BTC trade-delivery comparison
+  between Quicknode gRPC `TRADES` and the Foundation `trades` WebSocket.
+- Reconstruct Quicknode's paired fill records into the same canonical trade
+  identity used by Foundation: coin, trade timestamp and ID, taker side, price,
+  size, hash, buyer, and seller.
+- Measure absolute trade-event-to-canonical-trade-ready latency under the
+  `hyperliquid-market-benchmark-v2` schema. This is feed delivery latency, not
+  order-to-fill or exchange execution latency.
+- Preserve the existing v1 three-source contract for BBO and L2Book.
+
 ## 0.1.2 - 2026-07-11
 
 - Treat a stream message observed a few milliseconds after the publication

@@ -1,15 +1,20 @@
 # Limitations
 
 - The observer measures event timestamp to application-visible canonical book
-  readiness at the runner. It is not a pure network RTT, server processing time,
-  or exchange matching-engine latency measurement.
+  or trade readiness at the runner. It is not a pure network RTT, server
+  processing time, order-to-fill latency, or exchange matching-engine latency
+  measurement.
 - Hyperliquid supplies the event timestamps. Any error or semantic change in
   those timestamps affects every path.
-- Only complete books that match the Foundation-defined reference set on all
-  three paths enter latency distributions. Coverage and mismatch counters are
-  necessary context for that conditional sample.
-- The current comparison includes Quicknode gRPC, Foundation WebSocket, and
-  Hydromancer WebSocket.
+- Only complete canonical events that match the Foundation-defined reference
+  set on every dataset path enter latency distributions. Coverage and mismatch
+  counters are necessary context for that conditional sample.
+- BBO and L2Book include Quicknode gRPC, Foundation WebSocket, and Hydromancer
+  WebSocket. Fills initially includes Quicknode gRPC and Foundation WebSocket;
+  Hydromancer's user-scoped fills API is not treated as an equivalent
+  market-wide trade feed.
+- A fills sample measures delivery of an already executed public trade. It says
+  nothing about when a customer's order was submitted, acknowledged, or filled.
 - P50/P95/P99 are exact for each rolling five-minute window. The dashboard does
   not claim that an aggregate of those windows is an exact selected-range
   percentile.

@@ -2,26 +2,28 @@
 
 ## Measurement question
 
-For a Hyperliquid book event, how old is the event timestamp when an application
-at a particular observer can use the decoded and canonicalized book?
+For a Hyperliquid book event or executed trade, how old is the upstream
+timestamp when an application at a particular observer can use the decoded and
+canonicalized market data?
 
-The collector answers that question independently for Quicknode gRPC,
-Hyperliquid Foundation WebSocket, and Hydromancer WebSocket. It does not report
-who arrived first as a latency value. All reported P50/P95/P99 values are
-absolute milliseconds from the event timestamp.
+For BBO and L2Book, the collector answers that question independently for
+Quicknode gRPC, Hyperliquid Foundation WebSocket, and Hydromancer WebSocket. For
+fills, it compares Quicknode gRPC `TRADES` with the Foundation `trades`
+WebSocket. It does not report who arrived first as a latency value. All reported
+P50/P95/P99 values are absolute milliseconds from the upstream timestamp.
 
 ```mermaid
 flowchart LR
     E["Hyperliquid event timestamp"] --> T["Transport delivery"]
     T --> D["Decode and validate"]
-    D --> C["Normalize and canonicalize book"]
+    D --> C["Normalize and canonicalize book or trade"]
     C --> R["Observer wall-clock timestamp"]
     R --> L["Absolute event-to-ready latency"]
-    C --> M["Exact three-source content match"]
+    C --> M["Exact dataset-source content match"]
 ```
 
 The receipt timestamp is captured immediately after canonical construction and
-before the event enters the bounded cohort queue. JSON and Protobuf decoding are
+before the observation enters the bounded cohort queue. JSON and Protobuf decoding are
 therefore included for every path. Cohort matching and Axiom publication are not
 included in the measured latency.
 
@@ -38,18 +40,36 @@ content. All three sources must produce the exact same key. A base coin/timestam
 is sealed as a unit after its five-second deadline; a late duplicate or unseen
 revision cannot reopen it. Admission order does not select the winning revision.
 
+## Canonical trades
+
+Foundation `trades` messages provide one market-wide trade with coin, trade
+timestamp, trade ID, taker side, price, size, hash, and buyer/seller users.
+Quicknode's generic `TRADES` stream carries the two account-side fill records
+from the same `NodeFillsByBlock` trade. The collector requires one crossed ask
+and bid record, validates their common identity and economics, derives the taker
+side, and constructs the same buyer/seller ordering.
+
+The fills cohort key is coin plus trade timestamp and ID plus canonical taker
+side, price, size, hash, buyer, and seller. Both sources must produce exactly
+that key. The receipt boundary is after the full message has been decoded,
+validated, paired where necessary, numerically normalized, and converted to the
+canonical trade. This measures public trade-feed delivery. It does not measure
+customer order submission, acknowledgement, order-to-fill, or exchange
+matching-engine execution latency.
+
 ## Foundation reference set
 
 Foundation defines the reference event universe used for coverage. Accordingly,
 Foundation's own coverage is labeled “reference set,” not presented as a
-provider availability percentage. Quicknode and Hydromancer coverage mean
-“matched to the Foundation reference.”
+provider availability percentage. Other active-source coverage means “matched
+to the Foundation reference.”
 
-Latency distributions contain only complete, content-identical three-source
-cohorts. This makes the three provider distributions comparable, but it also
-creates an explicit selection condition: events missing or mismatched on any
-path are excluded from all three latency distributions. Coverage and failure
-counters must be interpreted beside the quantiles.
+Latency distributions contain only complete, content-identical cohorts across
+all active sources: three for books and two for fills. This makes provider
+distributions comparable, but it also creates an explicit selection condition:
+events missing or mismatched on any active path are excluded from every latency
+distribution in that dataset. Coverage and failure counters must be interpreted
+beside the quantiles.
 
 ## Rolling distributions
 
@@ -74,11 +94,12 @@ samples and cannot be re-percentiled to obtain an exact selected-range P99.
 
 Each 30-second publication interval has one deterministic interval identity and
 counts each complete cohort exactly once. The exact same interval fields are
-repeated on the three provider rows only to preserve the logical three-row window.
-Consumers first require all three copies to agree, then count the interval once.
+repeated on every provider row only to preserve the logical dataset window.
+Consumers first require all expected copies to agree, then count the interval
+once.
 
 For each complete cohort, the provider with the lowest integer-millisecond
-absolute latency receives one strict-fastest count. If two or three paths share
+absolute latency receives one strict-fastest count. If multiple paths share
 the minimum, the cohort increments the explicit tie count and no provider.
 Strict-fastest counts plus ties therefore equal the complete interval cohort
 count. Selected-range shares are sums of these non-overlapping counts, never
@@ -103,7 +124,7 @@ counted; they are never clamped to zero.
 
 ## Publication and replay
 
-One process handles BBO and another handles L2Book. Connections persist across
+One process handles each of BBO, L2Book, and fills. Connections persist across
 publication intervals and reconnect only after a real failure. Every atomic
 window is fsynced to a bounded disk outbox, renamed into place, and delivered
 oldest-first. An operating-system lock gives each dataset outbox exactly one

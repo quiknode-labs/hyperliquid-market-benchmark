@@ -7,13 +7,24 @@ use serde::Serialize;
 use crate::axiom::IngestHealthSnapshot;
 use crate::clock::ClockHealthSnapshot;
 use crate::model::{
-    BaseKey, BookEvent, BookKey, Dataset, EventKey, PROVIDERS, ProbeEvent, Provider, RuntimeSignals,
+    BaseKey, ContentKey, Dataset, EventKey, MarketEvent, ProbeEvent, Provider, RuntimeSignals,
 };
 
+#[cfg(test)]
+use crate::model::PROVIDERS;
+#[cfg(test)]
 pub const SCHEMA: &str = "hyperliquid-market-benchmark-v1";
+#[cfg(test)]
+pub const FILLS_SCHEMA: &str = "hyperliquid-market-benchmark-v2";
 pub const EVENT_TYPE: &str = "latency_window";
+#[cfg(test)]
 pub const METRIC_KIND: &str = "event_to_canonical_book_ready";
+#[cfg(test)]
+pub const FILLS_METRIC_KIND: &str = "event_to_canonical_trade_ready";
+#[cfg(test)]
 pub const MEASUREMENT_VERSION: &str = "canonical-book-ready-v1";
+#[cfg(test)]
+pub const FILLS_MEASUREMENT_VERSION: &str = "canonical-trade-ready-v1";
 pub const SOURCE_COMMIT: &str = env!("BENCHMARK_SOURCE_COMMIT");
 pub const MIN_READY_SAMPLES: usize = 1_000;
 const MAX_FUTURE_SKEW_MS: u64 = 5_000;
@@ -111,7 +122,7 @@ impl PendingCandidate {
 
 struct PendingBase {
     first_observed: Instant,
-    candidates: HashMap<BookKey, PendingCandidate>,
+    candidates: HashMap<ContentKey, PendingCandidate>,
 }
 
 impl PendingBase {
@@ -357,7 +368,7 @@ impl Benchmark {
 
     pub fn record(&mut self, event: ProbeEvent) {
         match event {
-            ProbeEvent::Book(event) => self.record_book(event),
+            ProbeEvent::Market(event) => self.record_market(event),
             ProbeEvent::Reconnect { provider, coin } => {
                 self.counters_mut(provider, &coin).reconnects += 1;
             }
@@ -423,11 +434,12 @@ impl Benchmark {
         let clock_checked_at =
             format_time(UNIX_EPOCH + Duration::from_millis(clock.checked_at_wall_ms));
         let mut outcome_counts = HashMap::with_capacity(self.config.coins.len());
+        let providers = self.config.dataset.providers();
         for coin in &self.config.coins {
             let window = self.windows.get(coin).expect("registered coin");
-            outcome_counts.insert(coin.clone(), unreported_outcomes(window, now));
+            outcome_counts.insert(coin.clone(), unreported_outcomes(window, now, providers));
         }
-        let mut events = Vec::with_capacity(self.config.coins.len() * PROVIDERS.len());
+        let mut events = Vec::with_capacity(self.config.coins.len() * providers.len());
 
         for coin in &self.config.coins {
             let window_id = format!(
@@ -458,7 +470,7 @@ impl Benchmark {
             let state_integrity_complete = window.last_integrity_loss.is_none_or(|lost| {
                 now.saturating_duration_since(lost) > self.config.rolling_window
             });
-            let queue_integrity_complete = PROVIDERS.iter().all(|provider| {
+            let queue_integrity_complete = providers.iter().all(|provider| {
                 let dropped_at = signals.snapshot(*provider, coin).last_queue_drop_wall_ms;
                 dropped_at == 0
                     || (dropped_at <= actual_wall_ms
@@ -466,10 +478,10 @@ impl Benchmark {
                             > self.config.rolling_window.as_millis() as u64)
             });
             let integrity_complete = state_integrity_complete && queue_integrity_complete;
-            let cohort_connections_live = PROVIDERS
+            let cohort_connections_live = providers
                 .iter()
                 .all(|provider| signals.snapshot(*provider, coin).connection_up);
-            let cohort_messages_fresh = PROVIDERS.iter().all(|provider| {
+            let cohort_messages_fresh = providers.iter().all(|provider| {
                 let last_message = signals.snapshot(*provider, coin).last_message_wall_ms;
                 stream_message_age_ms(actual_wall_ms, last_message)
                     .is_some_and(|age| age <= self.config.stale_after.as_millis() as u64)
@@ -480,7 +492,7 @@ impl Benchmark {
                 && clock_assessment.healthy;
             let outcome_interval_complete = outcome_schedule_complete && cohort_health_complete;
 
-            for provider in PROVIDERS {
+            for &provider in providers {
                 let values = window
                     .cohorts
                     .iter()
@@ -518,16 +530,16 @@ impl Benchmark {
 
                 events.push(LatencyWindowEvent {
                     time: window_end.clone(),
-                    schema: SCHEMA,
+                    schema: self.config.dataset.schema(),
                     event_type: EVENT_TYPE,
-                    metric_kind: METRIC_KIND,
+                    metric_kind: self.config.dataset.metric_kind(),
                     benchmark_version: env!("CARGO_PKG_VERSION"),
-                    measurement_version: MEASUREMENT_VERSION,
+                    measurement_version: self.config.dataset.measurement_version(),
                     source_commit: SOURCE_COMMIT,
                     artifact_sha256: self.config.artifact_sha256.clone(),
                     event_id: format!(
                         "{}:{}:{}:{}",
-                        SCHEMA,
+                        self.config.dataset.schema(),
                         self.config.run_id,
                         window_id,
                         public_provider(provider)
@@ -555,7 +567,7 @@ impl Benchmark {
                     },
                     run_id: self.config.run_id.clone(),
                     runner_uptime_seconds: now.saturating_duration_since(self.started_at).as_secs(),
-                    cohort: "hyperliquid-ws+hydromancer-ws+quicknode-grpc",
+                    cohort: self.config.dataset.cohort(),
                     cohort_complete,
                     sample_count,
                     min_ready_samples: MIN_READY_SAMPLES as u64,
@@ -691,8 +703,11 @@ impl Benchmark {
         self.prepared_outcome_interval = None;
     }
 
-    fn record_book(&mut self, event: BookEvent) {
+    fn record_market(&mut self, event: MarketEvent) {
         let provider = event.provider;
+        if !self.config.dataset.providers().contains(&provider) {
+            return;
+        }
         let coin = event.key.coin.clone();
         let counters = self.counters_mut(provider, &coin);
         if event.key.event_ms == 0 {
@@ -752,7 +767,7 @@ impl Benchmark {
             .entry(base.clone())
             .or_insert_with(|| PendingBase::new(event.received));
         cohort.first_observed = cohort.first_observed.min(event.received);
-        if !cohort.candidates.contains_key(&event.key.book)
+        if !cohort.candidates.contains_key(&event.key.content)
             && cohort.candidates.len() >= MAX_SIGNATURES_PER_BASE
         {
             self.counters_mut(provider, &coin).signature_overflow += 1;
@@ -761,7 +776,7 @@ impl Benchmark {
         }
         let candidate = cohort
             .candidates
-            .entry(event.key.book.clone())
+            .entry(event.key.content.clone())
             .or_insert_with(|| PendingCandidate::new(event.received));
         candidate.first_observed = candidate.first_observed.min(event.received);
         if candidate.arrivals[provider.index()].is_some() {
@@ -785,7 +800,7 @@ impl Benchmark {
             window.last_integrity_loss = Some(now);
         }
         for candidate in pending.candidates.values_mut() {
-            for provider in PROVIDERS {
+            for &provider in self.config.dataset.providers() {
                 let arrived_after_deadline = candidate.arrivals[provider.index()]
                     .as_ref()
                     .is_some_and(|arrival| {
@@ -800,33 +815,33 @@ impl Benchmark {
                 }
             }
         }
-        let foundation_books = pending
+        let foundation_content = pending
             .candidates
             .iter()
             .filter(|(_, candidate)| candidate.arrivals[Provider::FoundationWs.index()].is_some())
-            .map(|(book, _)| book.clone())
+            .map(|(content, _)| content.clone())
             .collect::<HashSet<_>>();
         let mut noncanonical_seen = [false; 3];
-        for (book, candidate) in &pending.candidates {
-            if foundation_books.contains(book) {
+        for (content, candidate) in &pending.candidates {
+            if foundation_content.contains(content) {
                 continue;
             }
-            for provider in PROVIDERS {
+            for &provider in self.config.dataset.providers() {
                 if candidate.arrivals[provider.index()].is_some() {
                     noncanonical_seen[provider.index()] = true;
                     self.counters_mut(provider, &key.coin).orphaned += 1;
                 }
             }
         }
-        for (book, candidate) in pending.candidates {
-            if !foundation_books.contains(&book) {
+        for (content, candidate) in pending.candidates {
+            if !foundation_content.contains(&content) {
                 continue;
             }
             self.finalize_candidate(
                 EventKey {
                     coin: key.coin.clone(),
                     event_ms: key.event_ms,
-                    book,
+                    content,
                 },
                 candidate,
                 now,
@@ -843,12 +858,14 @@ impl Benchmark {
         noncanonical_seen: [bool; 3],
     ) {
         debug_assert!(candidate.arrivals[Provider::FoundationWs.index()].is_some());
-        let complete = candidate.arrivals.iter().all(Option::is_some);
+        let providers = self.config.dataset.providers();
+        let complete = providers
+            .iter()
+            .all(|provider| candidate.arrivals[provider.index()].is_some());
         let settled_at = if complete {
-            candidate
-                .arrivals
+            providers
                 .iter()
-                .flatten()
+                .filter_map(|provider| candidate.arrivals[provider.index()].as_ref())
                 .map(|arrival| arrival.received)
                 .max()
                 .expect("complete candidate has arrivals")
@@ -857,7 +874,7 @@ impl Benchmark {
         };
         let mut outcomes = [CoverageOutcome::Missing; 3];
         let mut matched_mask = 0;
-        for provider in PROVIDERS {
+        for &provider in providers {
             let counters = self.counters_mut(provider, &key.coin);
             if candidate.arrivals[provider.index()].is_some() {
                 counters.matched += 1;
@@ -893,7 +910,7 @@ impl Benchmark {
         }
         if complete {
             let mut latency_ms = [0; 3];
-            for provider in PROVIDERS {
+            for &provider in providers {
                 latency_ms[provider.index()] = candidate.arrivals[provider.index()]
                     .as_ref()
                     .expect("complete cohort")
@@ -1021,7 +1038,7 @@ fn distribution(mut values: Vec<u64>) -> Option<Distribution> {
     })
 }
 
-fn unreported_outcomes(window: &CoinWindow, now: Instant) -> OutcomeCounts {
+fn unreported_outcomes(window: &CoinWindow, now: Instant, providers: &[Provider]) -> OutcomeCounts {
     let mut counts = OutcomeCounts::default();
     for cohort in window
         .cohorts
@@ -1029,8 +1046,12 @@ fn unreported_outcomes(window: &CoinWindow, now: Instant) -> OutcomeCounts {
         .filter(|cohort| !cohort.outcome_reported && cohort.committed_at <= now)
     {
         counts.complete += 1;
-        let fastest = *cohort.latency_ms.iter().min().expect("three-source cohort");
-        let fastest_providers = PROVIDERS
+        let fastest = providers
+            .iter()
+            .map(|provider| cohort.latency_ms[provider.index()])
+            .min()
+            .expect("complete cohort");
+        let fastest_providers = providers
             .iter()
             .copied()
             .filter(|provider| cohort.latency_ms[provider.index()] == fastest)
@@ -1155,12 +1176,12 @@ mod tests {
     }
 
     fn book(provider: Provider, event_ms: u64, wall_ms: u64, now: Instant, px: &str) -> ProbeEvent {
-        ProbeEvent::Book(BookEvent {
+        ProbeEvent::Market(MarketEvent {
             provider,
             key: EventKey {
                 coin: "BTC".to_owned(),
                 event_ms,
-                book: BookKey::Bbo {
+                content: ContentKey::Bbo {
                     bid: Some(LevelKey {
                         px: px.to_owned(),
                         sz: "1".to_owned(),
@@ -1171,6 +1192,26 @@ mod tests {
                         sz: "1".to_owned(),
                         n: 1,
                     }),
+                },
+            },
+            received: now,
+            received_wall_ms: wall_ms,
+        })
+    }
+
+    fn trade(provider: Provider, event_ms: u64, wall_ms: u64, now: Instant) -> ProbeEvent {
+        ProbeEvent::Market(MarketEvent {
+            provider,
+            key: EventKey {
+                coin: "BTC".to_owned(),
+                event_ms,
+                content: ContentKey::Trade {
+                    tid: 7,
+                    side: "A".to_owned(),
+                    px: "100".to_owned(),
+                    sz: "2".to_owned(),
+                    hash: "0xabc".to_owned(),
+                    users: ["0xbuyer".to_owned(), "0xseller".to_owned()],
                 },
             },
             received: now,
@@ -1333,6 +1374,56 @@ mod tests {
     }
 
     #[test]
+    fn fills_publish_an_exact_two_source_trade_ready_contract() {
+        let now = Instant::now();
+        let coins = vec!["BTC".to_owned()];
+        let mut config = BenchmarkConfig::production(
+            Dataset::Fills,
+            coins.clone(),
+            "aws".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "aws-nrt-01".to_owned(),
+            "fills-run".to_owned(),
+        );
+        config.cohort_timeout = Duration::from_secs(1);
+        let mut benchmark = Benchmark::new(config, now, UNIX_EPOCH);
+        let signals = RuntimeSignals::new(&coins);
+
+        benchmark.record(trade(Provider::FoundationWs, 1_000, 1_200, now));
+        benchmark.record(trade(Provider::QuickNodeGrpc, 1_000, 1_100, now));
+        settle_pending(&mut benchmark, now);
+        for provider in Dataset::Fills.providers() {
+            signals.set_test_state(*provider, "BTC", true, 29_999, 0);
+        }
+
+        let events = benchmark.window_events(
+            now + Duration::from_secs(2),
+            UNIX_EPOCH + Duration::from_millis(30_000),
+            &signals,
+            IngestHealthSnapshot::default(),
+            healthy_clock(30_000),
+        );
+
+        assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
+        assert_eq!(
+            benchmark.windows["BTC"].cohorts[0].latency_ms,
+            [200, 0, 100]
+        );
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|event| {
+            event.schema == FILLS_SCHEMA
+                && event.metric_kind == FILLS_METRIC_KIND
+                && event.measurement_version == FILLS_MEASUREMENT_VERSION
+                && event.cohort == "hyperliquid-ws+quicknode-grpc"
+                && event.sample_count == 1
+        }));
+        assert!(events.iter().all(|event| event.provider != "hydromancer"));
+        assert_eq!(events[0].outcome_hydromancer_strict_fastest_count, 0);
+        assert_eq!(events[0].outcome_hydromancer_tied_fastest_count, 0);
+    }
+
+    #[test]
     fn same_millisecond_book_revisions_are_two_distinct_cohorts() {
         let now = Instant::now();
         let (mut benchmark, _) = config(now);
@@ -1386,6 +1477,7 @@ mod tests {
         assert!(!benchmark.pending.contains_key(&BaseKey {
             coin: "BTC".to_owned(),
             event_ms: 1_000,
+            trade_id: None,
         }));
         assert!(
             PROVIDERS
@@ -1452,7 +1544,7 @@ mod tests {
             assert_eq!(window.coverage_evictions, 0);
             assert_eq!(window.last_integrity_loss, None);
             assert_eq!(
-                unreported_outcomes(window, now + Duration::from_secs(3)).complete,
+                unreported_outcomes(window, now + Duration::from_secs(3), &PROVIDERS).complete,
                 1
             );
             assert!(benchmark.pending.is_empty());
@@ -1479,11 +1571,13 @@ mod tests {
         assert_eq!(
             unreported_outcomes(
                 &late_then_early.windows["BTC"],
-                now + Duration::from_secs(3)
+                now + Duration::from_secs(3),
+                &PROVIDERS,
             ),
             unreported_outcomes(
                 &early_then_late.windows["BTC"],
-                now + Duration::from_secs(3)
+                now + Duration::from_secs(3),
+                &PROVIDERS,
             )
         );
     }

@@ -11,11 +11,14 @@ pub const PROVIDERS: [Provider; 3] = [
     Provider::HydromancerWs,
     Provider::QuickNodeGrpc,
 ];
+pub const BOOK_PROVIDERS: [Provider; 3] = PROVIDERS;
+pub const FILLS_PROVIDERS: [Provider; 2] = [Provider::FoundationWs, Provider::QuickNodeGrpc];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum Dataset {
     Bbo,
     L2book,
+    Fills,
 }
 
 impl Dataset {
@@ -23,6 +26,7 @@ impl Dataset {
         match self {
             Self::Bbo => "bbo",
             Self::L2book => "l2Book",
+            Self::Fills => "trades",
         }
     }
 
@@ -30,6 +34,42 @@ impl Dataset {
         match self {
             Self::Bbo => "bbo",
             Self::L2book => "l2book",
+            Self::Fills => "fills",
+        }
+    }
+
+    pub const fn providers(self) -> &'static [Provider] {
+        match self {
+            Self::Bbo | Self::L2book => &BOOK_PROVIDERS,
+            Self::Fills => &FILLS_PROVIDERS,
+        }
+    }
+
+    pub const fn schema(self) -> &'static str {
+        match self {
+            Self::Bbo | Self::L2book => "hyperliquid-market-benchmark-v1",
+            Self::Fills => "hyperliquid-market-benchmark-v2",
+        }
+    }
+
+    pub const fn metric_kind(self) -> &'static str {
+        match self {
+            Self::Bbo | Self::L2book => "event_to_canonical_book_ready",
+            Self::Fills => "event_to_canonical_trade_ready",
+        }
+    }
+
+    pub const fn measurement_version(self) -> &'static str {
+        match self {
+            Self::Bbo | Self::L2book => "canonical-book-ready-v1",
+            Self::Fills => "canonical-trade-ready-v1",
+        }
+    }
+
+    pub const fn cohort(self) -> &'static str {
+        match self {
+            Self::Bbo | Self::L2book => "hyperliquid-ws+hydromancer-ws+quicknode-grpc",
+            Self::Fills => "hyperliquid-ws+quicknode-grpc",
         }
     }
 }
@@ -70,7 +110,7 @@ impl Provider {
 pub struct EventKey {
     pub coin: String,
     pub event_ms: u64,
-    pub book: BookKey,
+    pub content: ContentKey,
 }
 
 impl EventKey {
@@ -78,6 +118,10 @@ impl EventKey {
         BaseKey {
             coin: self.coin.clone(),
             event_ms: self.event_ms,
+            trade_id: match &self.content {
+                ContentKey::Trade { tid, .. } => Some(*tid),
+                ContentKey::Bbo { .. } | ContentKey::L2 { .. } => None,
+            },
         }
     }
 }
@@ -86,10 +130,11 @@ impl EventKey {
 pub struct BaseKey {
     pub coin: String,
     pub event_ms: u64,
+    pub trade_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum BookKey {
+pub enum ContentKey {
     Bbo {
         bid: Option<LevelKey>,
         ask: Option<LevelKey>,
@@ -97,6 +142,14 @@ pub enum BookKey {
     L2 {
         bids: Vec<LevelKey>,
         asks: Vec<LevelKey>,
+    },
+    Trade {
+        tid: u64,
+        side: String,
+        px: String,
+        sz: String,
+        hash: String,
+        users: [String; 2],
     },
 }
 
@@ -108,7 +161,7 @@ pub struct LevelKey {
 }
 
 #[derive(Debug)]
-pub struct BookEvent {
+pub struct MarketEvent {
     pub provider: Provider,
     pub key: EventKey,
     pub received: Instant,
@@ -117,7 +170,7 @@ pub struct BookEvent {
 
 #[derive(Debug)]
 pub enum ProbeEvent {
-    Book(BookEvent),
+    Market(MarketEvent),
     Reconnect {
         provider: Provider,
         coin: String,
@@ -256,13 +309,13 @@ impl ProbeSender {
 
     pub async fn send(&self, event: ProbeEvent) -> bool {
         match event {
-            ProbeEvent::Book(book) => {
-                let signal = self.signals.stream(book.provider, &book.key.coin);
-                let received_wall_ms = book.received_wall_ms;
+            ProbeEvent::Market(market) => {
+                let signal = self.signals.stream(market.provider, &market.key.coin);
+                let received_wall_ms = market.received_wall_ms;
                 signal
                     .last_message_wall_ms
                     .store(received_wall_ms, Ordering::Relaxed);
-                match self.tx.try_send(ProbeEvent::Book(book)) {
+                match self.tx.try_send(ProbeEvent::Market(market)) {
                     Ok(()) => true,
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         signal.queue_dropped.fetch_add(1, Ordering::Relaxed);
@@ -276,7 +329,7 @@ impl ProbeSender {
             }
             control => {
                 let (provider, coin) = match &control {
-                    ProbeEvent::Book(_) => unreachable!("book handled above"),
+                    ProbeEvent::Market(_) => unreachable!("market event handled above"),
                     ProbeEvent::Reconnect { provider, coin }
                     | ProbeEvent::SequenceGap { provider, coin, .. }
                     | ProbeEvent::Replay { provider, coin, .. } => (*provider, coin.as_str()),
@@ -309,13 +362,13 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
 
-    fn book(coin: &str) -> BookEvent {
-        BookEvent {
+    fn market_event(coin: &str) -> MarketEvent {
+        MarketEvent {
             provider: Provider::FoundationWs,
             key: EventKey {
                 coin: coin.to_owned(),
                 event_ms: 1,
-                book: BookKey::Bbo {
+                content: ContentKey::Bbo {
                     bid: None,
                     ask: Some(LevelKey {
                         px: "1".to_owned(),
@@ -336,8 +389,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel(1);
         let sender = ProbeSender::new(tx, signals.clone());
 
-        assert!(sender.send(ProbeEvent::Book(book("BTC"))).await);
-        assert!(sender.send(ProbeEvent::Book(book("BTC"))).await);
+        assert!(sender.send(ProbeEvent::Market(market_event("BTC"))).await);
+        assert!(sender.send(ProbeEvent::Market(market_event("BTC"))).await);
         assert!(
             sender
                 .send(ProbeEvent::Reconnect {

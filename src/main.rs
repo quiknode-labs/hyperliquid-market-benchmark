@@ -32,10 +32,10 @@ const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle"];
 #[command(
     name = "hyperliquid-market-benchmark",
     version,
-    about = "Continuously measure Hyperliquid event-to-canonical-book-ready latency from three matched sources"
+    about = "Continuously measure matched Hyperliquid book and trade delivery latency"
 )]
 struct Args {
-    /// Book dataset measured by this process. Run one process per dataset.
+    /// Market dataset measured by this process. Run one process per dataset.
     #[arg(long, value_enum, default_value_t = Dataset::Bbo)]
     dataset: Dataset,
 
@@ -143,7 +143,15 @@ async fn main() -> Result<()> {
     )?;
     validate_public_identity(&args.runner, &cloud, &region, &metro)?;
 
-    let hydromancer_token = required_secret("HYDROMANCER_API_KEY")?;
+    let hydromancer_token = if args
+        .dataset
+        .providers()
+        .contains(&model::Provider::HydromancerWs)
+    {
+        required_secret("HYDROMANCER_API_KEY")?
+    } else {
+        String::new()
+    };
     let quicknode_token = required_secret("QUICKNODE_HYPERLIQUID_TOKEN")?;
     tonic::metadata::MetadataValue::try_from(quicknode_token.as_str())
         .context("QUICKNODE_HYPERLIQUID_TOKEN contains invalid header characters")?;
@@ -217,7 +225,7 @@ async fn main() -> Result<()> {
     );
 
     info!(
-        schema = benchmark::SCHEMA,
+        schema = args.dataset.schema(),
         dataset = args.dataset.label(),
         coins = %coins.join(","),
         %cloud,
