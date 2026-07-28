@@ -24,6 +24,7 @@ const ROLLING_WINDOW: Duration = Duration::from_secs(300);
 const PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 const PUBLICATION_DEADLINE: Duration = Duration::from_secs(20);
 const COHORT_TIMEOUT: Duration = Duration::from_secs(5);
+const COHORT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 const STALE_AFTER: Duration = Duration::from_secs(60);
 const MAX_COINS_PER_PROCESS: usize = 10;
 const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle"];
@@ -240,6 +241,11 @@ async fn main() -> Result<()> {
 
     let mut publish = tokio::time::interval_at(next_publish_deadline(), PUBLISH_INTERVAL);
     publish.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cohort_maintenance = tokio::time::interval_at(
+        tokio::time::Instant::now() + COHORT_MAINTENANCE_INTERVAL,
+        COHORT_MAINTENANCE_INTERVAL,
+    );
+    cohort_maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -264,6 +270,9 @@ async fn main() -> Result<()> {
                 )
                 .await
                 .context("latency-window publication exceeded its liveness deadline")??;
+            }
+            _ = cohort_maintenance.tick() => {
+                benchmark.tick(Instant::now());
             }
             signal = &mut shutdown => {
                 signal?;
@@ -523,5 +532,26 @@ mod tests {
         );
         assert!(normalize_artifact_sha256("secret-or-not-a-digest").is_err());
         assert!(normalize_artifact_sha256(&"a".repeat(63)).is_err());
+    }
+
+    #[test]
+    fn fills_pending_capacity_covers_timeout_plus_maintenance_jitter() {
+        let config = BenchmarkConfig::production(
+            Dataset::Fills,
+            vec!["BTC".to_owned()],
+            "aws".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "aws-nrt-01".to_owned(),
+            "test-run".to_owned(),
+        );
+        let maximum_pending_seconds =
+            (COHORT_TIMEOUT + COHORT_MAINTENANCE_INTERVAL).as_secs() as usize;
+        let required_pending = benchmark::FILLS_DESIGN_COHORTS_PER_SECOND
+            .checked_mul(maximum_pending_seconds)
+            .unwrap();
+
+        assert!(COHORT_MAINTENANCE_INTERVAL < COHORT_TIMEOUT);
+        assert!(config.max_pending >= required_pending);
     }
 }
