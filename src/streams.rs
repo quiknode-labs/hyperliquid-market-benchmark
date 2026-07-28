@@ -247,7 +247,7 @@ async fn run_foundation_once(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if last_frame.elapsed() >= WS_READ_TIMEOUT {
+                if read_deadline_exceeded(last_frame, Instant::now()) {
                     anyhow::bail!("Foundation websocket read deadline exceeded");
                 }
                 sink.send(Message::Ping(Vec::new().into())).await?;
@@ -343,7 +343,7 @@ async fn run_hydromancer_once(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if last_frame.elapsed() >= WS_READ_TIMEOUT {
+                if read_deadline_exceeded(last_frame, Instant::now()) {
                     anyhow::bail!("Hydromancer websocket read deadline exceeded");
                 }
                 sink.send(Message::Ping(Vec::new().into())).await?;
@@ -624,6 +624,7 @@ async fn run_quicknode_once(
             let mut stream = client.stream_data(request).await?.into_inner();
             let _connection = sender.connected(Provider::QuickNodeGrpc, coin);
             let mut heartbeat = heartbeat_interval();
+            let mut last_frame = Instant::now();
 
             loop {
                 tokio::select! {
@@ -633,6 +634,7 @@ async fn run_quicknode_once(
                         else {
                             break;
                         };
+                        last_frame = Instant::now();
                         let Some(crate::grpc::pb::subscribe_update::Update::Data(data)) =
                             update.update
                         else {
@@ -664,6 +666,11 @@ async fn run_quicknode_once(
                         }
                     }
                     _ = heartbeat.tick() => {
+                        if read_deadline_exceeded(last_frame, Instant::now()) {
+                            anyhow::bail!(
+                                "Quicknode fills gRPC application-message deadline exceeded"
+                            );
+                        }
                         request_tx
                             .send(SubscribeRequest {
                                 request: Some(
@@ -687,6 +694,10 @@ fn heartbeat_interval() -> tokio::time::Interval {
         tokio::time::interval_at(tokio::time::Instant::now() + WS_HEARTBEAT, WS_HEARTBEAT);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     interval
+}
+
+fn read_deadline_exceeded(last_frame: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_frame) >= WS_READ_TIMEOUT
 }
 
 async fn grpc_channel(endpoint: &str) -> Result<Channel> {
@@ -1209,6 +1220,19 @@ mod tests {
             backoff.after_connection(HEALTHY_CONNECTION),
             INITIAL_RECONNECT_BACKOFF
         );
+    }
+
+    #[test]
+    fn read_deadline_trips_at_the_exact_timeout_boundary() {
+        let connected_at = Instant::now();
+        assert!(!read_deadline_exceeded(
+            connected_at,
+            connected_at + WS_READ_TIMEOUT - Duration::from_millis(1)
+        ));
+        assert!(read_deadline_exceeded(
+            connected_at,
+            connected_at + WS_READ_TIMEOUT
+        ));
     }
 
     #[test]
