@@ -132,6 +132,17 @@ writer. Ambiguity after the durable rename is fatal so the supervisor restarts
 the process instead of silently losing a window. A fully acknowledged file is
 never posted again: local unlink or directory-fsync cleanup is retried locally.
 
+Fills use dataset-specific state limits sized for an aggregate 1,000 matched
+cohorts per second across the five-minute window: 300,000 rolling cohorts,
+400,000 settled entries for mismatch and replay headroom, and 25,000 pending
+bases for 25 seconds of burst capacity. A one-second maintenance tick settles
+bases after the five-second cohort timeout independently of the thirty-second
+publication cadence, so normal pending occupancy at the design rate stays near
+6,000 or below. When multiple coins share a fills process, the rolling limit is
+divided across them so the process-wide memory envelope stays bounded. Book
+datasets retain their lower event-rate limits. Any cap eviction is published as
+integrity loss rather than silently producing a percentile.
+
 Delivery is deliberately at least once. A partial acknowledgement or a lost
 response can cause a complete immutable batch to be posted again. `event_id` is
 deterministic for measurement schema, run, window, and provider, so a normal

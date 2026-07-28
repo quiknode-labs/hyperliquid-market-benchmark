@@ -32,6 +32,11 @@ const MAX_SIGNATURES_PER_BASE: usize = 4;
 const DEFAULT_MAX_PENDING: usize = 5_000;
 const DEFAULT_MAX_SETTLED: usize = 20_000;
 const DEFAULT_MAX_ROLLING_COHORTS: usize = 25_000;
+pub(crate) const FILLS_DESIGN_COHORTS_PER_SECOND: usize = 1_000;
+const FILLS_PENDING_BURST_SECONDS: usize = 25;
+const FILLS_MAX_PENDING: usize = FILLS_DESIGN_COHORTS_PER_SECOND * FILLS_PENDING_BURST_SECONDS;
+const FILLS_MAX_SETTLED: usize = 400_000;
+const FILLS_MAX_ROLLING_COHORTS_PER_PROCESS: usize = FILLS_DESIGN_COHORTS_PER_SECOND * 300;
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkConfig {
@@ -62,6 +67,8 @@ impl BenchmarkConfig {
         runner: String,
         run_id: String,
     ) -> Self {
+        let (max_pending, max_settled, max_rolling_cohorts) =
+            production_state_capacity(dataset, coins.len());
         Self {
             dataset,
             coins,
@@ -75,10 +82,25 @@ impl BenchmarkConfig {
             publish_interval: Duration::from_secs(30),
             cohort_timeout: Duration::from_secs(5),
             stale_after: Duration::from_secs(60),
-            max_pending: DEFAULT_MAX_PENDING,
-            max_settled: DEFAULT_MAX_SETTLED,
-            max_rolling_cohorts: DEFAULT_MAX_ROLLING_COHORTS,
+            max_pending,
+            max_settled,
+            max_rolling_cohorts,
         }
+    }
+}
+
+fn production_state_capacity(dataset: Dataset, coin_count: usize) -> (usize, usize, usize) {
+    match dataset {
+        Dataset::Bbo | Dataset::L2book => (
+            DEFAULT_MAX_PENDING,
+            DEFAULT_MAX_SETTLED,
+            DEFAULT_MAX_ROLLING_COHORTS,
+        ),
+        Dataset::Fills => (
+            FILLS_MAX_PENDING,
+            FILLS_MAX_SETTLED,
+            FILLS_MAX_ROLLING_COHORTS_PER_PROCESS / coin_count.max(1),
+        ),
     }
 }
 
@@ -1243,6 +1265,42 @@ mod tests {
                 Duration::from_secs(30)
             ),
             60_000
+        );
+    }
+
+    #[test]
+    fn production_capacity_is_dataset_specific_and_bounds_multi_coin_fills() {
+        assert_eq!(
+            production_state_capacity(Dataset::Bbo, 1),
+            (
+                DEFAULT_MAX_PENDING,
+                DEFAULT_MAX_SETTLED,
+                DEFAULT_MAX_ROLLING_COHORTS
+            )
+        );
+        assert_eq!(
+            production_state_capacity(Dataset::L2book, 1),
+            (
+                DEFAULT_MAX_PENDING,
+                DEFAULT_MAX_SETTLED,
+                DEFAULT_MAX_ROLLING_COHORTS
+            )
+        );
+        assert_eq!(
+            production_state_capacity(Dataset::Fills, 1),
+            (
+                FILLS_MAX_PENDING,
+                FILLS_MAX_SETTLED,
+                FILLS_MAX_ROLLING_COHORTS_PER_PROCESS
+            )
+        );
+        assert_eq!(
+            production_state_capacity(Dataset::Fills, 3),
+            (
+                FILLS_MAX_PENDING,
+                FILLS_MAX_SETTLED,
+                FILLS_MAX_ROLLING_COHORTS_PER_PROCESS / 3
+            )
         );
     }
 
