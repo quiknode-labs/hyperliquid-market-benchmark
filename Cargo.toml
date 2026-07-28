@@ -1,9 +1,9 @@
 [package]
 name = "hyperliquid-market-benchmark"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Transparent three-source Hyperliquid canonical-book-ready latency benchmark"
+description = "Transparent matched-cohort Hyperliquid book and trade delivery latency benchmark"
 license = "Apache-2.0"
 repository = "https://github.com/quiknode-labs/hyperliquid-market-benchmark"
 homepage = "https://hyperliquid-market-benchmark-web.quicknode.workers.dev"
@@ -26,6 +26,7 @@ rust_decimal = "1.42.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tonic = { version = "0.14.6", default-features = false, features = ["channel", "codegen", "tls-webpki-roots"] }
 tonic-prost = "0.14.6"

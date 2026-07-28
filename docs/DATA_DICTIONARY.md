@@ -1,10 +1,13 @@
 # Axiom data dictionary
 
-The collector emits one JSON object per provider and coin for every successfully
-prepared publication boundary. The three rows for a window are an atomic logical
-record and use `schema=hyperliquid-market-benchmark-v1`,
-`event_type=latency_window`, and
-`metric_kind=event_to_canonical_book_ready`.
+The collector emits one JSON object per active provider and coin for every
+successfully prepared publication boundary. Rows for one window are an atomic
+logical record. BBO and L2Book emit three rows with
+`schema=hyperliquid-market-benchmark-v1` and
+`metric_kind=event_to_canonical_book_ready`. Fills emits Quicknode and
+Foundation rows with `schema=hyperliquid-market-benchmark-v2` and
+`metric_kind=event_to_canonical_trade_ready`. Every dataset uses
+`event_type=latency_window`.
 
 Optional numeric fields are omitted when the exact value is unavailable. A
 consumer must not replace an omitted value with zero.
@@ -16,13 +19,13 @@ consumer must not replace an omitted value with zero.
 | `_time` | RFC 3339 string | UTC-aligned publication boundary; same as `window_end`. |
 | `schema` | string | Machine-readable event schema. |
 | `event_type` | string | Always `latency_window` for chartable events. |
-| `metric_kind` | string | Always `event_to_canonical_book_ready`. |
+| `metric_kind` | string | `event_to_canonical_book_ready` for books or `event_to_canonical_trade_ready` for fills. |
 | `benchmark_version` | string | Collector package version. |
 | `measurement_version` | string | Independent semantic measurement contract version. |
 | `source_commit` | hex string or `unavailable` | Exact source revision embedded at build time. |
 | `artifact_sha256` | 64-char hex or `unavailable` | Operator-verified binary digest supplied at runtime. |
 | `event_id` | string | Deterministic schema/run/window/provider identity used for replay deduplication. |
-| `window_id` | string | Public runner, dataset, coin, and aligned boundary identity shared by three rows. |
+| `window_id` | string | Public runner, dataset, coin, and aligned boundary identity shared by all expected rows. |
 | `run_id` | UUID string | New process-run identity. A restart never silently merges runs. |
 
 ## Observer, source, and scope
@@ -32,7 +35,7 @@ consumer must not replace an omitted value with zero.
 | `provider` | enum | `quicknode`, `hyperliquid`, or `hydromancer`. |
 | `protocol` | enum | `grpc` for Quicknode; `ws` for Foundation and Hydromancer. |
 | `source` | enum | `quicknode-grpc`, `hyperliquid-ws`, or `hydromancer-ws`. |
-| `dataset` | enum | `bbo` or depth-20 `l2book`. |
+| `dataset` | enum | `bbo`, depth-20 `l2book`, or executed-trade `fills`. |
 | `coin` | string | Uppercase Hyperliquid coin identifier, initially `BTC`. |
 | `cloud` | string | Public observer cloud. Current deployment: `aws`, `gcp`, or `oracle`. |
 | `region` | string | Logical comparison region: `iad`, `us-west`, `fra`, `nrt`, or `sin`. |
@@ -43,7 +46,7 @@ consumer must not replace an omitted value with zero.
 | `window_end` | RFC 3339 string | End of the rolling distribution. |
 | `window_seconds` | integer | Rolling distribution duration; currently 300. |
 | `publish_interval_seconds` | integer | Nominal publication cadence; currently 30. |
-| `cohort` | string | Exact three-source cohort definition. |
+| `cohort` | string | Exact dataset-specific source and canonical-content cohort definition. |
 | `coverage_count_scope` | string | `rolling-window` for coverage counts. |
 | `health_count_scope` | string | `run-lifetime` for cumulative health counters. |
 
@@ -52,7 +55,7 @@ consumer must not replace an omitted value with zero.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `cohort_complete` | boolean | The rolling cohort passed state, queue, connection, freshness, and clock gates and has samples. |
-| `sample_count` | integer | Exact complete cohorts in the five-minute ring; identical across three rows. |
+| `sample_count` | integer | Exact complete cohorts in the five-minute ring; identical across all expected rows. |
 | `min_ready_samples` | integer | P99 readiness threshold; currently 1,000. |
 | `ready` | boolean | `cohort_complete` and `sample_count >= min_ready_samples`. |
 | `readiness` | enum string | `ready`, `warming-up`, or an explicit connection/clock/integrity reason. |
@@ -66,8 +69,9 @@ consumer must not replace an omitted value with zero.
 
 ## Non-overlapping outcome interval
 
-The fields below are identical on all three source rows. Consumers must require
-three identical copies and then count one interval, not three.
+The fields below are identical on all expected source rows. Consumers must
+require three identical copies for books or two for fills and then count one
+interval, not one per row.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -81,7 +85,7 @@ three identical copies and then count one interval, not three.
 | `outcome_foundation_strict_fastest_count` | integer | Cohorts with Foundation as the unique minimum. |
 | `outcome_hydromancer_strict_fastest_count` | integer | Cohorts with Hydromancer as the unique minimum. |
 | `outcome_tie_count` | integer | Cohorts whose minimum was shared by at least two paths. |
-| `outcome_{source}_tied_fastest_count` | integer | For transparency, how often that source participated in a two/three-way tie. |
+| `outcome_{source}_tied_fastest_count` | integer | For transparency, how often that active source participated in a tie. |
 
 For every valid interval:
 
@@ -89,6 +93,9 @@ For every valid interval:
 Quicknode strict + Foundation strict + Hydromancer strict + ties
 = outcome_complete_cohort_count
 ```
+
+For fills, the Hydromancer count is zero and the valid denominator is Quicknode
+strict + Foundation strict + ties.
 
 The first interval after a process starts and any interval spanning a rejected
 outbox admission are incomplete. They are visible for diagnosis but excluded
@@ -98,7 +105,7 @@ from selected-range share.
 
 | Field group | Scope | Meaning |
 | --- | --- | --- |
-| `observed_count` | run lifetime | Valid source books observed before exact matching. |
+| `observed_count` | run lifetime | Valid canonical source observations before exact matching. |
 | `matched_count`, `missing_count`, `mismatch_count` | rolling five minutes | Match to the Foundation reference; Foundation itself is the reference set. |
 | `matched_total`, `missing_total`, `mismatch_total` | run lifetime | Cumulative counterparts. |
 | `duplicate_count`, `late_count`, `orphaned_count` | run lifetime | Sealed repeats, arrivals after deadline, and non-reference revisions. |

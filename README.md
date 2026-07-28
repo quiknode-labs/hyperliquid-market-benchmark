@@ -2,25 +2,32 @@
 
 ## What this is
 
-A continuous, open-source latency observer for Hyperliquid BBO and depth-20
-L2Book data. It compares three currently available paths on the same exact book
-events:
+A continuous, open-source latency observer for Hyperliquid BBO, depth-20
+L2Book, and executed BTC trades. Book datasets compare three paths on the same
+exact event:
 
 - Quicknode gRPC
 - Hyperliquid Foundation WebSocket
 - Hydromancer WebSocket
 
-The benchmark reports absolute latency, not a race delta and not a synthetic
-score:
+The `fills` dataset compares Quicknode gRPC with the Hyperliquid Foundation
+`trades` WebSocket. Hydromancer is intentionally outside that first fills
+comparison because its public API exposes user-scoped fills, not the same
+market-wide trade feed.
+
+The benchmark reports absolute delivery latency, not a race delta, synthetic
+score, order-to-fill latency, or matching-engine execution time:
 
 ```text
-local canonical-book-ready wall clock - Hyperliquid event timestamp
+books: local canonical-book-ready wall clock - Hyperliquid event timestamp
+fills: local canonical-trade-ready wall clock - Hyperliquid trade timestamp
 ```
 
 Each path is timestamped at the same semantic boundary: transport decoding,
-validation, numeric normalization, and canonical book construction have all
-completed. A book is admitted only when all three paths produced the same
-canonical content for the same coin and event timestamp.
+validation, numeric normalization, and canonical construction have completed.
+A book is admitted only when all three book paths produced the same canonical
+content. A trade is admitted only when Quicknode and Foundation produced the
+same coin, timestamp, trade ID, taker side, price, size, hash, buyer, and seller.
 
 The [deployed dashboard](https://hyperliquid-market-benchmark-web.quicknode.workers.dev)
 is designed for provider evaluation. This repository is the auditable producer
@@ -30,8 +37,9 @@ behind that data. Start with
 
 ## What is measured
 
-Every process maintains an exact five-minute ring of complete three-source
-cohorts and publishes one logical three-row Axiom window every 30 seconds.
+Every process maintains an exact five-minute ring of complete matched cohorts
+and publishes one logical Axiom window every 30 seconds: three rows for a book
+dataset and two rows for fills.
 Each source row contains empirical nearest-rank P50, P95, and P99 plus coverage,
 health, clock, provenance, and gap counters. It also repeats one exact
 non-overlapping publication-interval outcome record so selected-range fastest
@@ -49,8 +57,8 @@ average stored percentiles into a new percentile.
 
 ## Honesty rules this codebase enforces
 
-- A latency enters the comparison only when all three sources produced the same
-  canonical content for the same event.
+- A latency enters a comparison only when every source in that dataset produced
+  the same canonical content for the same event or trade.
 - P50, P95, and P99 are exact nearest-rank values over the collector's raw
   five-minute sample ring; the dashboard never averages stored percentiles.
 - Missing, late, stale, or integrity-invalid data remains an explicit gap.
@@ -102,17 +110,19 @@ export BENCHMARK_SOURCE_COMMIT="$(git rev-parse HEAD)"
 
 ### Run
 
-Run BBO and L2Book in separate processes so their load and failure state remain
+Run each dataset in a separate process so its load and failure state remain
 isolated:
 
 ```bash
 cargo run --release --locked -- --dataset bbo --coins BTC
 cargo run --release --locked -- --dataset l2book --coins BTC
+cargo run --release --locked -- --dataset fills --coins BTC
 ```
 
 `AXIOM_DATASET` defaults to `hyperliquid-market-benchmark`. The token must be a
 dataset-scoped ingest token; personal/query tokens are rejected. Persistent
-outbox data defaults to `/var/lib/hyperliquid-market-benchmark/{bbo|l2book}`.
+outbox data defaults to
+`/var/lib/hyperliquid-market-benchmark/{bbo|l2book|fills}`.
 Use `BENCHMARK_OUTBOX_DIR` for an unprivileged local run.
 
 Each provider reconnects independently, so one unavailable source produces an
