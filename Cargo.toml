@@ -1,9 +1,9 @@
 [package]
 name = "hyperliquid-market-benchmark"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.94"
-description = "Transparent matched-cohort Hyperliquid book and trade delivery latency benchmark"
+description = "Transparent Hyperliquid book, trade, and mempool delivery latency benchmark"
 license = "Apache-2.0"
 repository = "https://github.com/quiknode-labs/hyperliquid-market-benchmark"
 homepage = "https://hyperliquid-market-benchmark-web.quicknode.workers.dev"

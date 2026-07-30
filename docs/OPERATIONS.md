@@ -23,7 +23,7 @@ event.
 
 Required secrets:
 
-- `HYDROMANCER_API_KEY` (required for BBO and L2Book; not required for fills)
+- `HYDROMANCER_API_KEY` (required for BBO and L2Book; not required for fills or mempool)
 - `QUICKNODE_HYPERLIQUID_TOKEN`
 - `AXIOM_API_TOKEN` (dataset-scoped ingest token)
 
@@ -40,9 +40,9 @@ Required public observer configuration:
 - `BENCHMARK_REGION`
 - `BENCHMARK_METRO`
 
-Keep BBO, L2Book, and fills in separate service processes. Run as an unprivileged user,
-restrict the writable filesystem to the outbox directory, and set a restart
-policy. Never pass secrets in CLI arguments.
+Keep BBO, L2Book, fills, and mempool in separate service processes. Run as an
+unprivileged user, restrict the writable filesystem to the outbox directory,
+and set a restart policy. Never pass secrets in CLI arguments.
 
 ## Clock prerequisite
 
@@ -56,15 +56,15 @@ regression.
 
 ## Canary proof
 
-Before a fleet rollout, prove `bbo`, `l2book`, and the opt-in `fills` process on
-one observer:
+Before a fleet rollout, prove `bbo`, `l2book`, `fills`, and the opt-in `mempool`
+process on one observer:
 
 1. every process remains active and keeps its expected persistent connections
-   (three for books, two for fills);
+   (three for books, two for fills, one for mempool);
 2. runtime clock health is valid;
 3. outbox files are acknowledged and removed without drops;
-4. Axiom contains exactly three provider rows per book window and two per fills
-   window;
+4. Axiom contains exactly three provider rows per book window, two per fills
+   window, and one per mempool window;
 5. all rows agree on runner, run, window, interval outcome, and sample count;
 6. P50 <= P95 <= P99 and no negative/zero placeholder is synthesized;
 7. a deliberate credential failure is visible and recovers without data
@@ -82,9 +82,9 @@ reconnects, sequence gaps, replay gaps, outbox write failures, and cap rejection
 are emitted. An operator should alert on these integrity signals even when the
 process itself remains active.
 
-Each BBO, L2Book, or fills process must own a distinct outbox directory. The collector
-enforces this with an operating-system lock. A permanently rejected oldest batch
-intentionally blocks later batches to preserve strict FIFO order; alert on a
-non-draining backlog instead of deleting it. Lowering configured caps below an
-existing backlog prevents startup until the previous caps are restored or the
-backlog is handled deliberately.
+Each BBO, L2Book, fills, or mempool process must own a distinct outbox
+directory. The collector enforces this with an operating-system lock. A
+permanently rejected oldest batch intentionally blocks later batches to
+preserve strict FIFO order; alert on a non-draining backlog instead of deleting
+it. Lowering configured caps below an existing backlog prevents startup until
+the previous caps are restored or the backlog is handled deliberately.

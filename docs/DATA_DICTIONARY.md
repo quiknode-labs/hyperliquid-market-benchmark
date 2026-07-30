@@ -6,7 +6,9 @@ logical record. BBO and L2Book emit three rows with
 `schema=hyperliquid-market-benchmark-v1` and
 `metric_kind=event_to_canonical_book_ready`. Fills emits Quicknode and
 Foundation rows with `schema=hyperliquid-market-benchmark-v2` and
-`metric_kind=event_to_canonical_trade_ready`. Every dataset uses
+`metric_kind=event_to_canonical_trade_ready`. Mempool emits one Quicknode row
+with `schema=hyperliquid-market-benchmark-v3` and
+`metric_kind=mempool_first_seen_to_bundle_ready`. Every dataset uses
 `event_type=latency_window`.
 
 Optional numeric fields are omitted when the exact value is unavailable. A
@@ -19,7 +21,7 @@ consumer must not replace an omitted value with zero.
 | `_time` | RFC 3339 string | UTC-aligned publication boundary; same as `window_end`. |
 | `schema` | string | Machine-readable event schema. |
 | `event_type` | string | Always `latency_window` for chartable events. |
-| `metric_kind` | string | `event_to_canonical_book_ready` for books or `event_to_canonical_trade_ready` for fills. |
+| `metric_kind` | string | `event_to_canonical_book_ready` for books, `event_to_canonical_trade_ready` for fills, or `mempool_first_seen_to_bundle_ready` for mempool. |
 | `benchmark_version` | string | Collector package version. |
 | `measurement_version` | string | Independent semantic measurement contract version. |
 | `source_commit` | hex string or `unavailable` | Exact source revision embedded at build time. |
@@ -35,7 +37,7 @@ consumer must not replace an omitted value with zero.
 | `provider` | enum | `quicknode`, `hyperliquid`, or `hydromancer`. |
 | `protocol` | enum | `grpc` for Quicknode; `ws` for Foundation and Hydromancer. |
 | `source` | enum | `quicknode-grpc`, `hyperliquid-ws`, or `hydromancer-ws`. |
-| `dataset` | enum | `bbo`, depth-20 `l2book`, or executed-trade `fills`. |
+| `dataset` | enum | `bbo`, depth-20 `l2book`, executed-trade `fills`, or filtered-bundle `mempool`. |
 | `coin` | string | Uppercase Hyperliquid coin identifier, initially `BTC`. |
 | `cloud` | string | Public observer cloud. Current deployment: `aws`, `gcp`, or `oracle`. |
 | `region` | string | Logical comparison region: `iad`, `us-west`, `fra`, `nrt`, or `sin`. |
@@ -46,7 +48,7 @@ consumer must not replace an omitted value with zero.
 | `window_end` | RFC 3339 string | End of the rolling distribution. |
 | `window_seconds` | integer | Rolling distribution duration; currently 300. |
 | `publish_interval_seconds` | integer | Nominal publication cadence; currently 30. |
-| `cohort` | string | Exact dataset-specific source and canonical-content cohort definition. |
+| `cohort` | string | Exact dataset-specific source set. Mempool uses the one-source value `quicknode-grpc`. |
 | `coverage_count_scope` | string | `rolling-window` for coverage counts. |
 | `health_count_scope` | string | `run-lifetime` for cumulative health counters. |
 
@@ -73,9 +75,12 @@ The fields below are identical on all expected source rows. Consumers must
 require three identical copies for books or two for fills and then count one
 interval, not one per row.
 
+Mempool has no provider race. It emits `outcome_count_scope=not-applicable`,
+`outcome_interval_complete=false`, and zero for every outcome/fastest/tie count.
+
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `outcome_count_scope` | string | `non-overlapping-publication-interval`. |
+| `outcome_count_scope` | string | `non-overlapping-publication-interval` for comparison datasets or `not-applicable` for mempool. |
 | `outcome_interval_id` | string | Deterministic run/runner/dataset/coin/start/end identity. |
 | `outcome_interval_start`, `outcome_interval_end` | RFC 3339 string | Half-open outcome interval boundaries. |
 | `outcome_interval_duration_ms` | integer | Actual elapsed boundary span. |
@@ -95,7 +100,7 @@ Quicknode strict + Foundation strict + Hydromancer strict + ties
 ```
 
 For fills, the Hydromancer count is zero and the valid denominator is Quicknode
-strict + Foundation strict + ties.
+strict + Foundation strict + ties. The invariant does not apply to mempool.
 
 The first interval after a process starts and any interval spanning a rejected
 outbox admission are incomplete. They are visible for diagnosis but excluded
@@ -106,7 +111,7 @@ from selected-range share.
 | Field group | Scope | Meaning |
 | --- | --- | --- |
 | `observed_count` | run lifetime | Valid canonical source observations before exact matching. |
-| `matched_count`, `missing_count`, `mismatch_count` | rolling five minutes | Match to the Foundation reference; Foundation itself is the reference set. |
+| `matched_count`, `missing_count`, `mismatch_count` | rolling five minutes | For comparison datasets, match to the Foundation reference. For mempool, `matched_count` is valid admitted Quicknode bundles; the one-source `missing_count` and `mismatch_count` remain zero. |
 | `matched_total`, `missing_total`, `mismatch_total` | run lifetime | Cumulative counterparts. |
 | `duplicate_count`, `late_count`, `orphaned_count` | run lifetime | Sealed repeats, arrivals after deadline, and non-reference revisions. |
 | `negative_latency_count`, `future_timestamp_count` | run lifetime | Rejected wall-clock/event-time anomalies. |
@@ -119,6 +124,8 @@ from selected-range share.
 
 `missing_count` includes the `mismatch_count` subset. The consumer should show
 Foundation as “Reference set” and show other coverage as “Match to Foundation.”
+For mempool, the consumer should instead label `matched_count` as valid bundles
+and must not imply a Foundation comparison.
 
 ## Runtime clock
 
