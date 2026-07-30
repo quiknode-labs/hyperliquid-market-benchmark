@@ -13,12 +13,14 @@ pub const PROVIDERS: [Provider; 3] = [
 ];
 pub const BOOK_PROVIDERS: [Provider; 3] = PROVIDERS;
 pub const FILLS_PROVIDERS: [Provider; 2] = [Provider::FoundationWs, Provider::QuickNodeGrpc];
+pub const MEMPOOL_PROVIDERS: [Provider; 1] = [Provider::QuickNodeGrpc];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum Dataset {
     Bbo,
     L2book,
     Fills,
+    Mempool,
 }
 
 impl Dataset {
@@ -27,6 +29,7 @@ impl Dataset {
             Self::Bbo => "bbo",
             Self::L2book => "l2Book",
             Self::Fills => "trades",
+            Self::Mempool => "mempool_txs",
         }
     }
 
@@ -35,6 +38,7 @@ impl Dataset {
             Self::Bbo => "bbo",
             Self::L2book => "l2book",
             Self::Fills => "fills",
+            Self::Mempool => "mempool",
         }
     }
 
@@ -42,6 +46,7 @@ impl Dataset {
         match self {
             Self::Bbo | Self::L2book => &BOOK_PROVIDERS,
             Self::Fills => &FILLS_PROVIDERS,
+            Self::Mempool => &MEMPOOL_PROVIDERS,
         }
     }
 
@@ -49,6 +54,7 @@ impl Dataset {
         match self {
             Self::Bbo | Self::L2book => "hyperliquid-market-benchmark-v1",
             Self::Fills => "hyperliquid-market-benchmark-v2",
+            Self::Mempool => "hyperliquid-market-benchmark-v3",
         }
     }
 
@@ -56,6 +62,7 @@ impl Dataset {
         match self {
             Self::Bbo | Self::L2book => "event_to_canonical_book_ready",
             Self::Fills => "event_to_canonical_trade_ready",
+            Self::Mempool => "mempool_first_seen_to_bundle_ready",
         }
     }
 
@@ -63,6 +70,7 @@ impl Dataset {
         match self {
             Self::Bbo | Self::L2book => "canonical-book-ready-v1",
             Self::Fills => "canonical-trade-ready-v1",
+            Self::Mempool => "mempool-bundle-ready-v1",
         }
     }
 
@@ -70,7 +78,19 @@ impl Dataset {
         match self {
             Self::Bbo | Self::L2book => "hyperliquid-ws+hydromancer-ws+quicknode-grpc",
             Self::Fills => "hyperliquid-ws+quicknode-grpc",
+            Self::Mempool => "quicknode-grpc",
         }
+    }
+
+    pub const fn reference_provider(self) -> Provider {
+        match self {
+            Self::Bbo | Self::L2book | Self::Fills => Provider::FoundationWs,
+            Self::Mempool => Provider::QuickNodeGrpc,
+        }
+    }
+
+    pub const fn has_provider_comparison(self) -> bool {
+        !matches!(self, Self::Mempool)
     }
 }
 
@@ -120,7 +140,11 @@ impl EventKey {
             event_ms: self.event_ms,
             trade_id: match &self.content {
                 ContentKey::Trade { tid, .. } => Some(*tid),
-                ContentKey::Bbo { .. } | ContentKey::L2 { .. } => None,
+                ContentKey::Bbo { .. } | ContentKey::L2 { .. } | ContentKey::Mempool { .. } => None,
+            },
+            mempool_tx_hash: match &self.content {
+                ContentKey::Mempool { tx_hash } => Some(tx_hash.clone()),
+                ContentKey::Bbo { .. } | ContentKey::L2 { .. } | ContentKey::Trade { .. } => None,
             },
         }
     }
@@ -131,6 +155,7 @@ pub struct BaseKey {
     pub coin: String,
     pub event_ms: u64,
     pub trade_id: Option<u64>,
+    pub mempool_tx_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -150,6 +175,9 @@ pub enum ContentKey {
         sz: String,
         hash: String,
         users: [String; 2],
+    },
+    Mempool {
+        tx_hash: String,
     },
 }
 

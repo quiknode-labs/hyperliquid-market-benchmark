@@ -3,8 +3,8 @@
 ## What this is
 
 A continuous, open-source latency observer for Hyperliquid BBO, depth-20
-L2Book, and executed BTC trades. Book datasets compare three paths on the same
-exact event:
+L2Book, executed BTC trades, and BTC pre-consensus mempool delivery. Book
+datasets compare three paths on the same exact event:
 
 - Quicknode gRPC
 - Hyperliquid Foundation WebSocket
@@ -15,19 +15,29 @@ The `fills` dataset compares Quicknode gRPC with the Hyperliquid Foundation
 comparison because its public API exposes user-scoped fills, not the same
 market-wide trade feed.
 
+The `mempool` dataset measures the Quicknode public gRPC path on its own. It
+subscribes to `MEMPOOL_TXS` through `StreamData` with the production
+`coin=BTC` server-side filter. There is no equivalent public source with the
+same pre-consensus bundle and first-seen timestamp, so mempool is an absolute
+delivery measurement rather than a provider race.
+
 The benchmark reports absolute delivery latency, not a race delta, synthetic
 score, order-to-fill latency, or matching-engine execution time:
 
 ```text
 books: local canonical-book-ready wall clock - Hyperliquid event timestamp
 fills: local canonical-trade-ready wall clock - Hyperliquid trade timestamp
+mempool: local decoded-bundle-ready wall clock - embedded first-seen timestamp
 ```
 
-Each path is timestamped at the same semantic boundary: transport decoding,
-validation, numeric normalization, and canonical construction have completed.
-A book is admitted only when all three book paths produced the same canonical
-content. A trade is admitted only when Quicknode and Foundation produced the
-same coin, timestamp, trade ID, taker side, price, size, hash, buyer, and seller.
+Each path is timestamped after its dataset-specific transport decoding and
+validation. Books and trades also complete numeric normalization and canonical
+construction before that boundary. A book is admitted only when all three book
+paths produced the same canonical content. A trade is admitted only when
+Quicknode and Foundation produced the same coin, timestamp, trade ID, taker
+side, price, size, hash, buyer, and seller. For mempool, the complete JSON bundle
+must decode and contain a valid first-seen timestamp, transaction hash, and
+non-empty signed-action list before the local receipt timestamp is captured.
 
 The [deployed dashboard](https://hyperliquid-market-benchmark-web.quicknode.workers.dev)
 is designed for provider evaluation. This repository is the auditable producer
@@ -37,20 +47,22 @@ behind that data. Start with
 
 ## What is measured
 
-Every process maintains an exact five-minute ring of complete matched cohorts
-and publishes one logical Axiom window every 30 seconds: three rows for a book
-dataset and two rows for fills.
+Every process maintains an exact five-minute ring of admitted observations and
+publishes one logical Axiom window every 30 seconds: three matched rows for a
+book dataset, two matched rows for fills, and one valid-bundle row for mempool.
 Each source row contains empirical nearest-rank P50, P95, and P99 plus coverage,
-health, clock, provenance, and gap counters. It also repeats one exact
-non-overlapping publication-interval outcome record so selected-range fastest
-shares can be summed without double counting. Equal millisecond latencies are
-ties; they are never assigned to a provider.
+health, clock, provenance, and gap counters. Comparison datasets also repeat one
+exact non-overlapping publication-interval outcome record so selected-range
+fastest shares can be summed without double counting. Equal millisecond
+latencies are ties; they are never assigned to a provider. Mempool has no
+fastest-share record because it has no equivalent comparison source.
 
 These scopes are deliberately different:
 
 - headline quantiles: the latest exact five-minute rolling window;
 - chart points: the selected quantile from successive five-minute windows;
-- fastest share: exact complete cohorts in non-overlapping 30-second intervals.
+- fastest share: exact complete comparison cohorts in non-overlapping 30-second
+  intervals; not applicable to mempool.
 
 The dashboard does not relabel a five-minute P99 as a one-hour P99 and does not
 average stored percentiles into a new percentile.
@@ -59,6 +71,9 @@ average stored percentiles into a new percentile.
 
 - A latency enters a comparison only when every source in that dataset produced
   the same canonical content for the same event or trade.
+- A mempool latency enters its single-source distribution only after the
+  filtered bundle is fully decoded and validated; raw payloads and transaction
+  hashes are never published to Axiom.
 - P50, P95, and P99 are exact nearest-rank values over the collector's raw
   five-minute sample ring; the dashboard never averages stored percentiles.
 - Missing, late, stale, or integrity-invalid data remains an explicit gap.
@@ -117,12 +132,16 @@ isolated:
 cargo run --release --locked -- --dataset bbo --coins BTC
 cargo run --release --locked -- --dataset l2book --coins BTC
 cargo run --release --locked -- --dataset fills --coins BTC
+cargo run --release --locked -- --dataset mempool --coins BTC
 ```
+
+The `mempool-bundle-ready-v1` measurement contract requires exactly
+`--coins BTC`; other datasets retain the general comma-separated coin option.
 
 `AXIOM_DATASET` defaults to `hyperliquid-market-benchmark`. The token must be a
 dataset-scoped ingest token; personal/query tokens are rejected. Persistent
 outbox data defaults to
-`/var/lib/hyperliquid-market-benchmark/{bbo|l2book|fills}`.
+`/var/lib/hyperliquid-market-benchmark/{bbo|l2book|fills|mempool}`.
 Use `BENCHMARK_OUTBOX_DIR` for an unprivileged local run.
 
 Each provider reconnects independently, so one unavailable source produces an

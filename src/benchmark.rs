@@ -16,15 +16,21 @@ use crate::model::PROVIDERS;
 pub const SCHEMA: &str = "hyperliquid-market-benchmark-v1";
 #[cfg(test)]
 pub const FILLS_SCHEMA: &str = "hyperliquid-market-benchmark-v2";
+#[cfg(test)]
+pub const MEMPOOL_SCHEMA: &str = "hyperliquid-market-benchmark-v3";
 pub const EVENT_TYPE: &str = "latency_window";
 #[cfg(test)]
 pub const METRIC_KIND: &str = "event_to_canonical_book_ready";
 #[cfg(test)]
 pub const FILLS_METRIC_KIND: &str = "event_to_canonical_trade_ready";
 #[cfg(test)]
+pub const MEMPOOL_METRIC_KIND: &str = "mempool_first_seen_to_bundle_ready";
+#[cfg(test)]
 pub const MEASUREMENT_VERSION: &str = "canonical-book-ready-v1";
 #[cfg(test)]
 pub const FILLS_MEASUREMENT_VERSION: &str = "canonical-trade-ready-v1";
+#[cfg(test)]
+pub const MEMPOOL_MEASUREMENT_VERSION: &str = "mempool-bundle-ready-v1";
 pub const SOURCE_COMMIT: &str = env!("BENCHMARK_SOURCE_COMMIT");
 pub const MIN_READY_SAMPLES: usize = 1_000;
 const MAX_FUTURE_SKEW_MS: u64 = 5_000;
@@ -37,6 +43,10 @@ const FILLS_PENDING_BURST_SECONDS: usize = 25;
 const FILLS_MAX_PENDING: usize = FILLS_DESIGN_COHORTS_PER_SECOND * FILLS_PENDING_BURST_SECONDS;
 const FILLS_MAX_SETTLED: usize = 400_000;
 const FILLS_MAX_ROLLING_COHORTS_PER_PROCESS: usize = FILLS_DESIGN_COHORTS_PER_SECOND * 300;
+pub(crate) const MEMPOOL_DESIGN_BUNDLES_PER_SECOND: usize = 200;
+const MEMPOOL_MAX_SETTLED: usize = 80_000;
+const MEMPOOL_MAX_ROLLING_COHORTS_PER_PROCESS: usize =
+    MEMPOOL_DESIGN_BUNDLES_PER_SECOND * 300 * 5 / 4;
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkConfig {
@@ -100,6 +110,11 @@ fn production_state_capacity(dataset: Dataset, coin_count: usize) -> (usize, usi
             FILLS_MAX_PENDING,
             FILLS_MAX_SETTLED,
             FILLS_MAX_ROLLING_COHORTS_PER_PROCESS / coin_count.max(1),
+        ),
+        Dataset::Mempool => (
+            DEFAULT_MAX_PENDING,
+            MEMPOOL_MAX_SETTLED,
+            MEMPOOL_MAX_ROLLING_COHORTS_PER_PROCESS / coin_count.max(1),
         ),
     }
 }
@@ -457,9 +472,17 @@ impl Benchmark {
             format_time(UNIX_EPOCH + Duration::from_millis(clock.checked_at_wall_ms));
         let mut outcome_counts = HashMap::with_capacity(self.config.coins.len());
         let providers = self.config.dataset.providers();
+        let has_provider_comparison = self.config.dataset.has_provider_comparison();
         for coin in &self.config.coins {
             let window = self.windows.get(coin).expect("registered coin");
-            outcome_counts.insert(coin.clone(), unreported_outcomes(window, now, providers));
+            outcome_counts.insert(
+                coin.clone(),
+                if has_provider_comparison {
+                    unreported_outcomes(window, now, providers)
+                } else {
+                    OutcomeCounts::default()
+                },
+            );
         }
         let mut events = Vec::with_capacity(self.config.coins.len() * providers.len());
 
@@ -512,7 +535,8 @@ impl Benchmark {
                 && cohort_connections_live
                 && cohort_messages_fresh
                 && clock_assessment.healthy;
-            let outcome_interval_complete = outcome_schedule_complete && cohort_health_complete;
+            let outcome_interval_complete =
+                has_provider_comparison && outcome_schedule_complete && cohort_health_complete;
 
             for &provider in providers {
                 let values = window
@@ -597,7 +621,11 @@ impl Benchmark {
                     readiness,
                     coverage_count_scope: "rolling-window",
                     health_count_scope: "run-lifetime",
-                    outcome_count_scope: "non-overlapping-publication-interval",
+                    outcome_count_scope: if has_provider_comparison {
+                        "non-overlapping-publication-interval"
+                    } else {
+                        "not-applicable"
+                    },
                     outcome_interval_id: outcome_interval_id.clone(),
                     outcome_interval_start: outcome_interval_start.clone(),
                     outcome_interval_end: window_end.clone(),
@@ -784,6 +812,7 @@ impl Benchmark {
             self.settle(oldest, event.received, true);
         }
 
+        let settle_immediately = self.config.dataset.providers().len() == 1;
         let cohort = self
             .pending
             .entry(base.clone())
@@ -809,6 +838,9 @@ impl Benchmark {
             received: event.received,
             received_wall_ms: event.received_wall_ms,
         });
+        if settle_immediately {
+            self.settle(base, event.received, false);
+        }
     }
 
     fn settle(&mut self, key: BaseKey, now: Instant, evicted: bool) {
@@ -837,15 +869,16 @@ impl Benchmark {
                 }
             }
         }
-        let foundation_content = pending
+        let reference_provider = self.config.dataset.reference_provider();
+        let reference_content = pending
             .candidates
             .iter()
-            .filter(|(_, candidate)| candidate.arrivals[Provider::FoundationWs.index()].is_some())
+            .filter(|(_, candidate)| candidate.arrivals[reference_provider.index()].is_some())
             .map(|(content, _)| content.clone())
             .collect::<HashSet<_>>();
         let mut noncanonical_seen = [false; 3];
         for (content, candidate) in &pending.candidates {
-            if foundation_content.contains(content) {
+            if reference_content.contains(content) {
                 continue;
             }
             for &provider in self.config.dataset.providers() {
@@ -856,7 +889,7 @@ impl Benchmark {
             }
         }
         for (content, candidate) in pending.candidates {
-            if !foundation_content.contains(&content) {
+            if !reference_content.contains(&content) {
                 continue;
             }
             self.finalize_candidate(
@@ -879,7 +912,9 @@ impl Benchmark {
         now: Instant,
         noncanonical_seen: [bool; 3],
     ) {
-        debug_assert!(candidate.arrivals[Provider::FoundationWs.index()].is_some());
+        debug_assert!(
+            candidate.arrivals[self.config.dataset.reference_provider().index()].is_some()
+        );
         let providers = self.config.dataset.providers();
         let complete = providers
             .iter()
@@ -1241,6 +1276,21 @@ mod tests {
         })
     }
 
+    fn mempool(event_ms: u64, wall_ms: u64, now: Instant, tx_hash: &str) -> ProbeEvent {
+        ProbeEvent::Market(MarketEvent {
+            provider: Provider::QuickNodeGrpc,
+            key: EventKey {
+                coin: "BTC".to_owned(),
+                event_ms,
+                content: ContentKey::Mempool {
+                    tx_hash: tx_hash.to_owned(),
+                },
+            },
+            received: now,
+            received_wall_ms: wall_ms,
+        })
+    }
+
     fn settle_pending(benchmark: &mut Benchmark, now: Instant) {
         benchmark.tick(now + Duration::from_secs(2));
     }
@@ -1300,6 +1350,22 @@ mod tests {
                 FILLS_MAX_PENDING,
                 FILLS_MAX_SETTLED,
                 FILLS_MAX_ROLLING_COHORTS_PER_PROCESS / 3
+            )
+        );
+        assert_eq!(
+            production_state_capacity(Dataset::Mempool, 1),
+            (
+                DEFAULT_MAX_PENDING,
+                MEMPOOL_MAX_SETTLED,
+                MEMPOOL_MAX_ROLLING_COHORTS_PER_PROCESS
+            )
+        );
+        assert_eq!(
+            production_state_capacity(Dataset::Mempool, 3),
+            (
+                DEFAULT_MAX_PENDING,
+                MEMPOOL_MAX_SETTLED,
+                MEMPOOL_MAX_ROLLING_COHORTS_PER_PROCESS / 3
             )
         );
     }
@@ -1482,6 +1548,90 @@ mod tests {
     }
 
     #[test]
+    fn mempool_publishes_one_quicknode_bundle_ready_row_without_race_outcomes() {
+        let now = Instant::now();
+        let coins = vec!["BTC".to_owned()];
+        let config = BenchmarkConfig::production(
+            Dataset::Mempool,
+            coins.clone(),
+            "aws".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "aws-nrt-01".to_owned(),
+            "mempool-run".to_owned(),
+        );
+        let mut benchmark = Benchmark::new(config, now, UNIX_EPOCH);
+        let signals = RuntimeSignals::new(&coins);
+
+        benchmark.record(mempool(1_000, 1_125, now, "0xabc"));
+        signals.set_test_state(Provider::QuickNodeGrpc, "BTC", true, 29_999, 0);
+
+        let events = benchmark.window_events(
+            now + Duration::from_secs(2),
+            UNIX_EPOCH + Duration::from_millis(30_000),
+            &signals,
+            IngestHealthSnapshot::default(),
+            healthy_clock(30_000),
+        );
+
+        assert!(benchmark.pending.is_empty());
+        assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
+        assert_eq!(benchmark.windows["BTC"].cohorts[0].latency_ms, [0, 0, 125]);
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.provider, "quicknode");
+        assert_eq!(event.protocol, "grpc");
+        assert_eq!(event.source, "quicknode-grpc");
+        assert_eq!(event.dataset, "mempool");
+        assert_eq!(event.schema, MEMPOOL_SCHEMA);
+        assert_eq!(event.metric_kind, MEMPOOL_METRIC_KIND);
+        assert_eq!(event.measurement_version, MEMPOOL_MEASUREMENT_VERSION);
+        assert_eq!(event.cohort, "quicknode-grpc");
+        assert_eq!(event.sample_count, 1);
+        assert_eq!(event.p50_ms, Some(125.0));
+        assert_eq!(event.p95_ms, Some(125.0));
+        assert_eq!(event.p99_ms, Some(125.0));
+        assert_eq!(event.matched_count, 1);
+        assert_eq!(event.missing_count, 0);
+        assert_eq!(event.pending_cohort_count, 0);
+        assert_eq!(event.outcome_count_scope, "not-applicable");
+        assert!(!event.outcome_interval_complete);
+        assert_eq!(event.outcome_complete_cohort_count, 0);
+        assert_eq!(event.outcome_quicknode_strict_fastest_count, 0);
+        assert_eq!(event.outcome_tie_count, 0);
+        let serialized = serde_json::to_string(event).unwrap();
+        assert!(!serialized.contains("0xabc"));
+        assert!(!serialized.contains("tx_hash"));
+    }
+
+    #[test]
+    fn distinct_mempool_bundles_in_the_same_millisecond_remain_distinct_samples() {
+        let now = Instant::now();
+        let coins = vec!["BTC".to_owned()];
+        let config = BenchmarkConfig::production(
+            Dataset::Mempool,
+            coins,
+            "aws".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "aws-nrt-01".to_owned(),
+            "mempool-run".to_owned(),
+        );
+        let mut benchmark = Benchmark::new(config, now, UNIX_EPOCH);
+
+        benchmark.record(mempool(1_000, 1_100, now, "0xaaa"));
+        benchmark.record(mempool(1_000, 1_101, now, "0xbbb"));
+
+        assert!(benchmark.pending.is_empty());
+        assert_eq!(benchmark.settled_bases.len(), 2);
+        assert_eq!(benchmark.windows["BTC"].cohorts.len(), 2);
+        assert_eq!(
+            benchmark.counters["BTC"][Provider::QuickNodeGrpc.index()].duplicate,
+            0
+        );
+    }
+
+    #[test]
     fn same_millisecond_book_revisions_are_two_distinct_cohorts() {
         let now = Instant::now();
         let (mut benchmark, _) = config(now);
@@ -1536,6 +1686,7 @@ mod tests {
             coin: "BTC".to_owned(),
             event_ms: 1_000,
             trade_id: None,
+            mempool_tx_hash: None,
         }));
         assert!(
             PROVIDERS

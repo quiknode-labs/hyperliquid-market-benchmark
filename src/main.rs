@@ -33,7 +33,7 @@ const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle"];
 #[command(
     name = "hyperliquid-market-benchmark",
     version,
-    about = "Continuously measure matched Hyperliquid book and trade delivery latency"
+    about = "Continuously measure Hyperliquid book, trade, and mempool delivery latency"
 )]
 struct Args {
     /// Market dataset measured by this process. Run one process per dataset.
@@ -130,6 +130,7 @@ async fn main() -> Result<()> {
     let max_clock_offset_ms = clock::validate_max_clock_offset_ms(args.max_clock_offset_ms)?;
     let artifact_sha256 = normalize_artifact_sha256(&args.artifact_sha256)?;
     let coins = parse_coins(&args.coins)?;
+    validate_dataset_coins(args.dataset, &coins)?;
     let (inferred_cloud, inferred_region, inferred_metro) = infer_location(&args.runner);
     let cloud = normalize_location("cloud", args.cloud.or(inferred_cloud), PUBLIC_CLOUDS)?;
     let region = normalize_location(
@@ -386,6 +387,13 @@ fn parse_coins(raw: &str) -> Result<Vec<String>> {
     Ok(coins)
 }
 
+fn validate_dataset_coins(dataset: Dataset, coins: &[String]) -> Result<()> {
+    if dataset == Dataset::Mempool && coins != ["BTC"] {
+        anyhow::bail!("the mempool-bundle-ready-v1 contract requires exactly --coins BTC");
+    }
+    Ok(())
+}
+
 fn required_secret(name: &str) -> Result<String> {
     std::env::var(name)
         .ok()
@@ -482,6 +490,17 @@ mod tests {
     }
 
     #[test]
+    fn mempool_v1_contract_is_explicitly_btc_only() {
+        assert!(validate_dataset_coins(Dataset::Mempool, &["BTC".to_owned()]).is_ok());
+        assert!(validate_dataset_coins(Dataset::Mempool, &["ETH".to_owned()]).is_err());
+        assert!(
+            validate_dataset_coins(Dataset::Mempool, &["BTC".to_owned(), "ETH".to_owned()])
+                .is_err()
+        );
+        assert!(validate_dataset_coins(Dataset::Bbo, &["ETH".to_owned()]).is_ok());
+    }
+
+    #[test]
     fn public_runner_id_supplies_location_without_private_hostname() {
         assert_eq!(
             infer_location("aws-nrt-01"),
@@ -553,5 +572,23 @@ mod tests {
 
         assert!(COHORT_MAINTENANCE_INTERVAL < COHORT_TIMEOUT);
         assert!(config.max_pending >= required_pending);
+    }
+
+    #[test]
+    fn mempool_rolling_capacity_covers_the_documented_design_rate() {
+        let config = BenchmarkConfig::production(
+            Dataset::Mempool,
+            vec!["BTC".to_owned()],
+            "aws".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "aws-nrt-01".to_owned(),
+            "test-run".to_owned(),
+        );
+        let required_rolling = benchmark::MEMPOOL_DESIGN_BUNDLES_PER_SECOND
+            .checked_mul(ROLLING_WINDOW.as_secs() as usize)
+            .unwrap();
+
+        assert!(config.max_rolling_cohorts >= required_rolling);
     }
 }

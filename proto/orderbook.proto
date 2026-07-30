@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package hyperliquid;
 
-// Generic customer stream used for raw HyperCore fills.
+// Generic customer stream used for raw HyperCore fills and mempool bundles.
 service Streaming {
   rpc StreamData(stream SubscribeRequest) returns (stream SubscribeUpdate);
 }

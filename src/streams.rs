@@ -4,6 +4,7 @@ use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, NaiveDateTime};
 use futures_util::{SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use serde::Deserialize;
@@ -34,7 +35,7 @@ const WS_HEARTBEAT: Duration = Duration::from_secs(20);
 const WS_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WS_MESSAGE_BYTES: usize = 1024 * 1024;
 const MAX_GRPC_MESSAGE_BYTES: usize = 1024 * 1024;
-const MAX_FILL_GRPC_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
+const MAX_STREAMING_GRPC_MESSAGE_BYTES: usize = 100 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct StreamConfig {
@@ -50,12 +51,14 @@ pub struct StreamConfig {
 pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandle<()>> {
     let mut tasks = Vec::with_capacity(config.coins.len() * config.dataset.providers().len());
     for coin in config.coins.clone() {
-        tasks.push(tokio::spawn(run_foundation(
-            config.foundation_ws.clone(),
-            coin.clone(),
-            config.dataset,
-            sender.clone(),
-        )));
+        if config.dataset.providers().contains(&Provider::FoundationWs) {
+            tasks.push(tokio::spawn(run_foundation(
+                config.foundation_ws.clone(),
+                coin.clone(),
+                config.dataset,
+                sender.clone(),
+            )));
+        }
         if config
             .dataset
             .providers()
@@ -69,13 +72,19 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
                 sender.clone(),
             )));
         }
-        tasks.push(tokio::spawn(run_quicknode(
-            config.quicknode_grpc.clone(),
-            config.quicknode_token.clone(),
-            coin,
-            config.dataset,
-            sender.clone(),
-        )));
+        if config
+            .dataset
+            .providers()
+            .contains(&Provider::QuickNodeGrpc)
+        {
+            tasks.push(tokio::spawn(run_quicknode(
+                config.quicknode_grpc.clone(),
+                config.quicknode_token.clone(),
+                coin,
+                config.dataset,
+                sender.clone(),
+            )));
+        }
     }
     tasks
 }
@@ -594,29 +603,20 @@ async fn run_quicknode_once(
                 }
             }
         }
-        Dataset::Fills => {
+        Dataset::Fills | Dataset::Mempool => {
             let mut client = StreamingClient::new(channel)
-                .max_decoding_message_size(MAX_FILL_GRPC_MESSAGE_BYTES)
+                .max_decoding_message_size(MAX_STREAMING_GRPC_MESSAGE_BYTES)
                 .max_encoding_message_size(64 * 1024);
             let (request_tx, request_rx) = mpsc::channel(4);
             request_tx
                 .send(SubscribeRequest {
                     request: Some(crate::grpc::pb::subscribe_request::Request::Subscribe(
-                        StreamSubscribe {
-                            stream_type: StreamType::Trades as i32,
-                            start_block: 0,
-                            filters: HashMap::from([(
-                                "coin".to_owned(),
-                                FilterValues {
-                                    values: vec![coin.to_owned()],
-                                },
-                            )]),
-                            filter_name: format!("benchmark-fills-{coin}"),
-                        },
+                        quicknode_stream_subscription(dataset, coin)
+                            .expect("generic stream dataset has a subscription"),
                     )),
                 })
                 .await
-                .context("queue Quicknode fills subscription")?;
+                .with_context(|| format!("queue Quicknode {} subscription", dataset.label()))?;
             let mut request = tonic::Request::new(ReceiverStream::new(request_rx));
             request
                 .metadata_mut()
@@ -630,7 +630,9 @@ async fn run_quicknode_once(
                 tokio::select! {
                     update = stream.message() => {
                         let Some(update) = update
-                            .context("Quicknode fills gRPC stream failed")?
+                            .with_context(|| {
+                                format!("Quicknode {} gRPC stream failed", dataset.label())
+                            })?
                         else {
                             break;
                         };
@@ -640,7 +642,15 @@ async fn run_quicknode_once(
                         else {
                             continue;
                         };
-                        let events = parse_quicknode_fill_batch(&data.data);
+                        let events = match dataset {
+                            Dataset::Fills => parse_quicknode_fill_batch(&data.data),
+                            Dataset::Mempool => parse_quicknode_mempool_bundle(&data.data, coin)
+                                .into_iter()
+                                .collect(),
+                            Dataset::Bbo | Dataset::L2book => unreachable!(
+                                "order-book datasets do not use the generic stream client"
+                            ),
+                        };
                         if events.is_empty() {
                             continue;
                         }
@@ -668,7 +678,8 @@ async fn run_quicknode_once(
                     _ = heartbeat.tick() => {
                         if read_deadline_exceeded(last_frame, Instant::now()) {
                             anyhow::bail!(
-                                "Quicknode fills gRPC application-message deadline exceeded"
+                                "Quicknode {} gRPC application-message deadline exceeded",
+                                dataset.label()
                             );
                         }
                         request_tx
@@ -680,13 +691,34 @@ async fn run_quicknode_once(
                                 ),
                             })
                             .await
-                            .context("send Quicknode fills heartbeat")?;
+                            .with_context(|| {
+                                format!("send Quicknode {} heartbeat", dataset.label())
+                            })?;
                     }
                 }
             }
         }
     }
     Ok(())
+}
+
+fn quicknode_stream_subscription(dataset: Dataset, coin: &str) -> Option<StreamSubscribe> {
+    let stream_type = match dataset {
+        Dataset::Fills => StreamType::Trades,
+        Dataset::Mempool => StreamType::MempoolTxs,
+        Dataset::Bbo | Dataset::L2book => return None,
+    };
+    Some(StreamSubscribe {
+        stream_type: stream_type as i32,
+        start_block: 0,
+        filters: HashMap::from([(
+            "coin".to_owned(),
+            FilterValues {
+                values: vec![coin.to_owned()],
+            },
+        )]),
+        filter_name: format!("benchmark-{}-{coin}", dataset.label()),
+    })
 }
 
 fn heartbeat_interval() -> tokio::time::Interval {
@@ -797,6 +829,9 @@ fn websocket_subscription(
         }),
         (Dataset::Fills, WsSubscriptionMode::Hydromancer) => {
             unreachable!("fills do not use a Hydromancer comparison stream")
+        }
+        (Dataset::Mempool, _) => {
+            unreachable!("mempool does not use a websocket comparison stream")
         }
     }
 }
@@ -1013,7 +1048,7 @@ fn parse_ws_book(frame: WsFrame, dataset: Dataset) -> Option<ParsedWsBook> {
                 content: ContentKey::L2 { bids, asks },
             }
         }
-        Dataset::Fills => return None,
+        Dataset::Fills | Dataset::Mempool => return None,
     };
     Some(ParsedWsBook {
         key,
@@ -1098,6 +1133,127 @@ fn parse_quicknode_fill_batch(payload: &str) -> Vec<EventKey> {
             )
         })
         .collect()
+}
+
+fn parse_quicknode_mempool_bundle(payload: &str, coin: &str) -> Option<EventKey> {
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let (timestamp, transaction) = if let Some(tuple) = value.as_array() {
+        (tuple.first()?.as_str()?, tuple.get(1)?)
+    } else {
+        let timestamp = value
+            .get("first_seen_time")
+            .or_else(|| value.get("time"))
+            .or_else(|| value.get("timestamp"))
+            .and_then(serde_json::Value::as_str)?;
+        (timestamp, &value)
+    };
+    let transaction = transaction.as_object()?;
+    let tx_hash = transaction.get("tx_hash")?.as_str()?;
+    let signed_actions = transaction.get("signed_actions")?.as_array()?;
+    let expected_asset_id = mempool_asset_id(coin)?;
+    if coin.is_empty()
+        || !valid_mempool_tx_hash(tx_hash)
+        || signed_actions.is_empty()
+        || signed_actions.iter().any(|action| !action.is_object())
+        || !signed_actions
+            .iter()
+            .any(|signed| mempool_action_matches_asset(signed.get("action"), expected_asset_id))
+    {
+        return None;
+    }
+    let event_ms = parse_mempool_timestamp_ms(timestamp)?;
+    Some(EventKey {
+        coin: coin.to_owned(),
+        event_ms,
+        content: ContentKey::Mempool {
+            tx_hash: tx_hash.to_ascii_lowercase(),
+        },
+    })
+}
+
+fn mempool_asset_id(coin: &str) -> Option<u64> {
+    match coin {
+        "BTC" => Some(0),
+        _ => None,
+    }
+}
+
+fn mempool_action_matches_asset(action: Option<&serde_json::Value>, expected: u64) -> bool {
+    let Some(action) = action else {
+        return false;
+    };
+    match action.get("type").and_then(serde_json::Value::as_str) {
+        Some("order") => mempool_array_has_asset(action.get("orders"), expected),
+        Some("cancel" | "cancelByCloid") => {
+            mempool_array_has_asset(action.get("cancels"), expected)
+        }
+        Some("batchModify") => action
+            .get("modifies")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|modifies| {
+                modifies.iter().any(|modify| {
+                    mempool_direct_asset_matches(modify.get("order"), expected)
+                        || mempool_direct_asset_matches(Some(modify), expected)
+                })
+            }),
+        Some("modify") => {
+            mempool_direct_asset_matches(action.get("order"), expected)
+                || mempool_direct_asset_matches(Some(action), expected)
+        }
+        Some("twapOrder") => mempool_direct_asset_matches(action.get("twap"), expected),
+        Some("twapCancel") => mempool_direct_asset_matches(Some(action), expected),
+        _ => false,
+    }
+}
+
+fn mempool_array_has_asset(values: Option<&serde_json::Value>, expected: u64) -> bool {
+    values
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| mempool_direct_asset_matches(Some(value), expected))
+        })
+}
+
+fn mempool_direct_asset_matches(value: Option<&serde_json::Value>, expected: u64) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    ["a", "asset"]
+        .into_iter()
+        .filter_map(|field| value.get(field))
+        .any(|asset| match asset {
+            serde_json::Value::Number(number) => number.as_u64() == Some(expected),
+            serde_json::Value::String(raw) => raw.parse::<u64>().ok() == Some(expected),
+            _ => false,
+        })
+}
+
+fn valid_mempool_tx_hash(tx_hash: &str) -> bool {
+    tx_hash.strip_prefix("0x").is_some_and(|hex| {
+        !hex.is_empty() && hex.len() <= 128 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    })
+}
+
+fn parse_mempool_timestamp_ms(timestamp: &str) -> Option<u64> {
+    let timestamp = timestamp.trim();
+    if timestamp.is_empty() {
+        return None;
+    }
+    let timestamp_ms = DateTime::parse_from_rfc3339(timestamp)
+        .map(|value| value.timestamp_millis())
+        .ok()
+        .or_else(|| {
+            ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
+                .into_iter()
+                .find_map(|format| {
+                    NaiveDateTime::parse_from_str(timestamp, format)
+                        .ok()
+                        .map(|value| value.and_utc().timestamp_millis())
+                })
+        })?;
+    u64::try_from(timestamp_ms).ok().filter(|value| *value > 0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1302,6 +1458,131 @@ mod tests {
         assert_eq!(
             Dataset::Fills.providers(),
             &[Provider::FoundationWs, Provider::QuickNodeGrpc]
+        );
+    }
+
+    #[test]
+    fn mempool_subscription_is_btc_filtered_stream_data_with_one_expected_source() {
+        let subscription = quicknode_stream_subscription(Dataset::Mempool, "BTC").unwrap();
+        assert_eq!(subscription.stream_type, StreamType::MempoolTxs as i32);
+        assert_eq!(subscription.start_block, 0);
+        assert_eq!(subscription.filter_name, "benchmark-mempool-BTC");
+        assert_eq!(subscription.filters["coin"].values, vec!["BTC".to_owned()]);
+        assert_eq!(Dataset::Mempool.providers(), &[Provider::QuickNodeGrpc]);
+        assert_eq!(
+            Dataset::Mempool.reference_provider(),
+            Provider::QuickNodeGrpc
+        );
+        assert!(!Dataset::Mempool.has_provider_comparison());
+    }
+
+    #[test]
+    fn parses_a_complete_mempool_bundle_at_the_application_ready_boundary() {
+        let tuple = parse_quicknode_mempool_bundle(
+            r#"["1970-01-01T00:00:01.234567890",{"tx_hash":"0xABC","signed_actions":[{"action":{"type":"order","orders":[{"a":0,"p":"100","s":"1"}]},"nonce":7}]}]"#,
+            "BTC",
+        )
+        .unwrap();
+        let object = parse_quicknode_mempool_bundle(
+            r#"{"first_seen_time":"1970-01-01T00:00:01.234567890","tx_hash":"0xABC","signed_actions":[{"action":{"type":"order","orders":[{"a":0,"p":"100","s":"1"}]},"nonce":7}]}"#,
+            "BTC",
+        )
+        .unwrap();
+        assert_eq!(tuple, object);
+        assert_eq!(tuple.coin, "BTC");
+        assert_eq!(tuple.event_ms, 1_234);
+        assert_eq!(
+            tuple.content,
+            ContentKey::Mempool {
+                tx_hash: "0xabc".to_owned()
+            }
+        );
+        let base = tuple.base();
+        assert_eq!(base.trade_id, None);
+        assert_eq!(base.mempool_tx_hash.as_deref(), Some("0xabc"));
+    }
+
+    #[test]
+    fn mempool_parser_rejects_incomplete_or_invalid_bundles() {
+        let cases = [
+            r#"["not-a-time",{"tx_hash":"0xabc","signed_actions":[{"action":{}}]}]"#,
+            r#"["1970-01-01T00:00:01Z",{"signed_actions":[{"action":{}}]}]"#,
+            r#"["1970-01-01T00:00:01Z",{"tx_hash":"abc","signed_actions":[{"action":{}}]}]"#,
+            r#"["1970-01-01T00:00:01Z",{"tx_hash":"0xzz","signed_actions":[{"action":{}}]}]"#,
+            r#"["1970-01-01T00:00:01Z",{"tx_hash":"0xabc","signed_actions":[]}]"#,
+            r#"["1970-01-01T00:00:01Z",{"tx_hash":"0xabc","signed_actions":["not-an-object"]}]"#,
+            r#"["1970-01-01T00:00:01Z",{"tx_hash":"0xabc","signed_actions":[{"action":{"type":"order","orders":[{"a":1}]}}]}]"#,
+            r#"{"tx_hash":"0xabc","signed_actions":[{"action":{}}]}"#,
+        ];
+        for payload in cases {
+            assert!(
+                parse_quicknode_mempool_bundle(payload, "BTC").is_none(),
+                "unexpectedly accepted {payload}"
+            );
+        }
+        assert!(
+            parse_quicknode_mempool_bundle(
+                r#"["1970-01-01T00:00:01Z",{"tx_hash":"0xabc","signed_actions":[{"action":{}}]}]"#,
+                "",
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn btc_filter_validation_covers_every_documented_order_touching_action() {
+        let actions = [
+            serde_json::json!({"type":"order","orders":[{"a":0}]}),
+            serde_json::json!({"type":"cancel","cancels":[{"asset":"0"}]}),
+            serde_json::json!({"type":"cancelByCloid","cancels":[{"a":0}]}),
+            serde_json::json!({"type":"batchModify","modifies":[{"order":{"a":0}}]}),
+            serde_json::json!({"type":"modify","order":{"asset":"0"}}),
+            serde_json::json!({"type":"twapOrder","twap":{"a":0}}),
+            serde_json::json!({"type":"twapCancel","asset":"0"}),
+        ];
+        for action in actions {
+            assert!(
+                mempool_action_matches_asset(Some(&action), 0),
+                "did not recognize {action}"
+            );
+        }
+        assert!(!mempool_action_matches_asset(
+            Some(&serde_json::json!({"type":"order","orders":[{"a":1}]})),
+            0,
+        ));
+        assert!(!mempool_action_matches_asset(
+            Some(&serde_json::json!({"type":"gossipPriorityBid","slotId":7})),
+            0,
+        ));
+    }
+
+    #[test]
+    fn large_mempool_bundle_with_a_late_btc_match_is_still_one_sample() {
+        let mut signed_actions = (0..5_699)
+            .map(|nonce| {
+                serde_json::json!({
+                    "action": {"type":"order","orders":[{"a":1,"p":"100","s":"1"}]},
+                    "nonce": nonce,
+                })
+            })
+            .collect::<Vec<_>>();
+        signed_actions.push(serde_json::json!({
+            "action": {"type":"twapOrder","twap":{"a":0}},
+            "nonce": 5_699,
+        }));
+        let payload = serde_json::json!([
+            "1970-01-01T00:00:01.234567890",
+            {"tx_hash":"0xabc","signed_actions":signed_actions},
+        ])
+        .to_string();
+
+        let parsed = parse_quicknode_mempool_bundle(&payload, "BTC").unwrap();
+        assert_eq!(parsed.event_ms, 1_234);
+        assert_eq!(
+            parsed.content,
+            ContentKey::Mempool {
+                tx_hash: "0xabc".to_owned()
+            }
         );
     }
 

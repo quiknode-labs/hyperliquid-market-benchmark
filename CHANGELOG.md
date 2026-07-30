@@ -4,6 +4,21 @@ All notable changes to the collector and measurement contract are documented
 here. Versions follow Semantic Versioning; measurement-contract changes are
 also identified independently in emitted events.
 
+## 0.3.0 - 2026-07-30
+
+- Add the `mempool` dataset as a single-source BTC pre-consensus delivery
+  measurement through the public Quicknode gRPC endpoint.
+- Subscribe with production `StreamData`, `MEMPOOL_TXS`, and the `coin=BTC`
+  server-side filter while leaving the protobuf and response body unchanged.
+- Measure the embedded bundle first-seen timestamp to full JSON
+  decoded-and-validated readiness under
+  `hyperliquid-market-benchmark-v3`.
+- Keep raw bundle payloads and transaction hashes out of Axiom and the durable
+  outbox.
+- Mark fastest-provider outcomes as not applicable instead of manufacturing a
+  one-source race.
+- Preserve the existing v1 book and v2 fills measurement contracts.
+
 ## 0.2.0 - 2026-07-28
 
 - Add the `fills` dataset as an exact two-source BTC trade-delivery comparison
