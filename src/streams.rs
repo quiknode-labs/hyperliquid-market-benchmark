@@ -46,6 +46,8 @@ pub struct StreamConfig {
     pub hydromancer_token: String,
     pub quicknode_grpc: String,
     pub quicknode_token: String,
+    pub peering_endpoint: String,
+    pub peering_reference: String,
 }
 
 pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandle<()>> {
@@ -80,8 +82,20 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
             tasks.push(tokio::spawn(run_quicknode(
                 config.quicknode_grpc.clone(),
                 config.quicknode_token.clone(),
-                coin,
+                coin.clone(),
                 config.dataset,
+                sender.clone(),
+            )));
+        }
+        if config
+            .dataset
+            .providers()
+            .contains(&Provider::QuickNodePeeringTcp)
+        {
+            tasks.push(tokio::spawn(crate::peering::run_peering(
+                config.peering_endpoint.clone(),
+                config.peering_reference.clone(),
+                coin,
                 sender.clone(),
             )));
         }
@@ -196,7 +210,7 @@ async fn run_quicknode(
 }
 
 #[derive(Debug)]
-struct ReconnectBackoff {
+pub(crate) struct ReconnectBackoff {
     next: Duration,
 }
 
@@ -209,7 +223,7 @@ impl Default for ReconnectBackoff {
 }
 
 impl ReconnectBackoff {
-    fn after_connection(&mut self, connected_for: Duration) -> Duration {
+    pub(crate) fn after_connection(&mut self, connected_for: Duration) -> Duration {
         if connected_for >= HEALTHY_CONNECTION {
             self.next = INITIAL_RECONNECT_BACKOFF;
         }
@@ -484,6 +498,7 @@ async fn run_quicknode_once(
         .max_encoding_message_size(64 * 1024);
 
     match dataset {
+        Dataset::Peering => unreachable!("peering does not use the Quicknode gRPC client"),
         Dataset::Bbo => {
             let mut request = tonic::Request::new(BboBookRequest {
                 coins: vec![coin.to_owned()],
@@ -650,6 +665,9 @@ async fn run_quicknode_once(
                             Dataset::Bbo | Dataset::L2book => unreachable!(
                                 "order-book datasets do not use the generic stream client"
                             ),
+                            Dataset::Peering => unreachable!(
+                                "peering does not use the Quicknode gRPC client"
+                            ),
                         };
                         if events.is_empty() {
                             continue;
@@ -706,7 +724,7 @@ fn quicknode_stream_subscription(dataset: Dataset, coin: &str) -> Option<StreamS
     let stream_type = match dataset {
         Dataset::Fills => StreamType::Trades,
         Dataset::Mempool => StreamType::MempoolTxs,
-        Dataset::Bbo | Dataset::L2book => return None,
+        Dataset::Bbo | Dataset::L2book | Dataset::Peering => return None,
     };
     Some(StreamSubscribe {
         stream_type: stream_type as i32,
@@ -832,6 +850,9 @@ fn websocket_subscription(
         }
         (Dataset::Mempool, _) => {
             unreachable!("mempool does not use a websocket comparison stream")
+        }
+        (Dataset::Peering, _) => {
+            unreachable!("peering does not use a websocket comparison stream")
         }
     }
 }
@@ -1048,7 +1069,7 @@ fn parse_ws_book(frame: WsFrame, dataset: Dataset) -> Option<ParsedWsBook> {
                 content: ContentKey::L2 { bids, asks },
             }
         }
-        Dataset::Fills | Dataset::Mempool => return None,
+        Dataset::Fills | Dataset::Mempool | Dataset::Peering => return None,
     };
     Some(ParsedWsBook {
         key,
@@ -1353,7 +1374,7 @@ fn hydromancer_ack_includes(values: &[serde_json::Value], channel: &str) -> bool
     })
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

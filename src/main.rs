@@ -17,6 +17,7 @@ mod benchmark;
 mod clock;
 mod grpc;
 mod model;
+mod peering;
 mod streams;
 
 const EVENT_QUEUE_CAPACITY: usize = 16_384;
@@ -53,8 +54,18 @@ struct Args {
     hydromancer_ws: String,
 
     /// Quicknode Hyperliquid gRPC endpoint. Authentication is read only from QUICKNODE_HYPERLIQUID_TOKEN.
+    /// Required for every dataset except peering.
     #[arg(long, env = "QUICKNODE_HYPERLIQUID_GRPC_URL")]
-    quicknode_grpc: String,
+    quicknode_grpc: Option<String>,
+
+    /// Quicknode peering endpoint (host:port). Anonymous public tier; no credentials exist.
+    #[arg(long, env = "QUICKNODE_PEERING_ENDPOINT")]
+    peering_endpoint: Option<String>,
+
+    /// Peering block reference feed (host:port, NDJSON). Deterministic chain data
+    /// reproducible from any Hyperliquid node's replay output; see METHODOLOGY.
+    #[arg(long, env = "PEERING_REFERENCE_FEED")]
+    peering_reference: Option<String>,
 
     /// Cloud measurement location. Inferred from the public runner ID when absent.
     #[arg(long, env = "BENCHMARK_CLOUD")]
@@ -154,9 +165,46 @@ async fn main() -> Result<()> {
     } else {
         String::new()
     };
-    let quicknode_token = required_secret("QUICKNODE_HYPERLIQUID_TOKEN")?;
-    tonic::metadata::MetadataValue::try_from(quicknode_token.as_str())
-        .context("QUICKNODE_HYPERLIQUID_TOKEN contains invalid header characters")?;
+    let quicknode_token = if args
+        .dataset
+        .providers()
+        .contains(&model::Provider::QuickNodeGrpc)
+    {
+        let token = required_secret("QUICKNODE_HYPERLIQUID_TOKEN")?;
+        tonic::metadata::MetadataValue::try_from(token.as_str())
+            .context("QUICKNODE_HYPERLIQUID_TOKEN contains invalid header characters")?;
+        token
+    } else {
+        String::new()
+    };
+    let quicknode_grpc = if args
+        .dataset
+        .providers()
+        .contains(&model::Provider::QuickNodeGrpc)
+    {
+        args.quicknode_grpc.clone().context(
+            "--quicknode-grpc (QUICKNODE_HYPERLIQUID_GRPC_URL) is required for this dataset",
+        )?
+    } else {
+        String::new()
+    };
+    let (peering_endpoint, peering_reference) = if args
+        .dataset
+        .providers()
+        .contains(&model::Provider::QuickNodePeeringTcp)
+    {
+        let endpoint = args.peering_endpoint.clone().context(
+            "--peering-endpoint (QUICKNODE_PEERING_ENDPOINT) is required for the peering dataset",
+        )?;
+        peering::validate_peering_endpoint(&endpoint, "peering endpoint")?;
+        let reference = args.peering_reference.clone().context(
+            "--peering-reference (PEERING_REFERENCE_FEED) is required for the peering dataset",
+        )?;
+        peering::validate_peering_endpoint(&reference, "peering reference feed")?;
+        (endpoint, reference)
+    } else {
+        (String::new(), String::new())
+    };
     let axiom_token = required_secret("AXIOM_API_TOKEN")?;
     let axiom_org_id = std::env::var("AXIOM_ORG_ID")
         .ok()
@@ -220,8 +268,10 @@ async fn main() -> Result<()> {
             foundation_ws: args.foundation_ws,
             hydromancer_ws: args.hydromancer_ws,
             hydromancer_token,
-            quicknode_grpc: args.quicknode_grpc,
+            quicknode_grpc,
             quicknode_token,
+            peering_endpoint,
+            peering_reference,
         },
         sender,
     );
@@ -390,6 +440,11 @@ fn parse_coins(raw: &str) -> Result<Vec<String>> {
 fn validate_dataset_coins(dataset: Dataset, coins: &[String]) -> Result<()> {
     if dataset == Dataset::Mempool && coins != ["BTC"] {
         anyhow::bail!("the mempool-bundle-ready-v1 contract requires exactly --coins BTC");
+    }
+    // Peering measures consensus blocks, not a market; the pinned label keeps the
+    // coin-keyed pipeline honest about that scope.
+    if dataset == Dataset::Peering && coins != ["BLOCKS"] {
+        anyhow::bail!("the peering-block-ready-v1 contract requires exactly --coins BLOCKS");
     }
     Ok(())
 }

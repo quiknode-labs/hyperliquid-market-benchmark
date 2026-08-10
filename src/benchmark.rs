@@ -7,11 +7,12 @@ use serde::Serialize;
 use crate::axiom::IngestHealthSnapshot;
 use crate::clock::ClockHealthSnapshot;
 use crate::model::{
-    BaseKey, ContentKey, Dataset, EventKey, MarketEvent, ProbeEvent, Provider, RuntimeSignals,
+    BaseKey, ContentKey, Dataset, EventKey, MarketEvent, PROVIDERS, ProbeEvent, Provider,
+    RuntimeSignals,
 };
 
 #[cfg(test)]
-use crate::model::PROVIDERS;
+use crate::model::BOOK_PROVIDERS;
 #[cfg(test)]
 pub const SCHEMA: &str = "hyperliquid-market-benchmark-v1";
 #[cfg(test)]
@@ -116,6 +117,13 @@ fn production_state_capacity(dataset: Dataset, coin_count: usize) -> (usize, usi
             MEMPOOL_MAX_SETTLED,
             MEMPOOL_MAX_ROLLING_COHORTS_PER_PROCESS / coin_count.max(1),
         ),
+        // Peering: ~15 consensus rounds/s -> ~4,500 complete-round samples per 5-minute
+        // window. The mempool-class limits leave >10x headroom for timing and replay.
+        Dataset::Peering => (
+            DEFAULT_MAX_PENDING,
+            MEMPOOL_MAX_SETTLED,
+            MEMPOOL_MAX_ROLLING_COHORTS_PER_PROCESS / coin_count.max(1),
+        ),
     }
 }
 
@@ -145,7 +153,7 @@ struct Observation {
 
 struct PendingCandidate {
     first_observed: Instant,
-    arrivals: [Option<Observation>; 3],
+    arrivals: [Option<Observation>; PROVIDERS.len()],
 }
 
 impl PendingCandidate {
@@ -180,7 +188,7 @@ struct SettledCohort {
 struct CommittedCohort {
     committed_at: Instant,
     event_ms: u64,
-    latency_ms: [u64; 3],
+    latency_ms: [u64; PROVIDERS.len()],
     commit_delay_ms: u64,
     outcome_reported: bool,
 }
@@ -195,7 +203,7 @@ enum CoverageOutcome {
 #[derive(Debug, Clone)]
 struct CoverageCohort {
     settled_at: Instant,
-    outcomes: [CoverageOutcome; 3],
+    outcomes: [CoverageOutcome; PROVIDERS.len()],
 }
 
 #[derive(Default)]
@@ -352,8 +360,8 @@ struct Distribution {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct OutcomeCounts {
     complete: u64,
-    strict_fastest: [u64; 3],
-    tied_fastest: [u64; 3],
+    strict_fastest: [u64; PROVIDERS.len()],
+    tied_fastest: [u64; PROVIDERS.len()],
     ties: u64,
 }
 
@@ -373,7 +381,7 @@ pub struct Benchmark {
     pending: HashMap<BaseKey, PendingBase>,
     settled_bases: HashMap<BaseKey, Instant>,
     settled: HashMap<EventKey, SettledCohort>,
-    counters: HashMap<String, [ProviderCounters; 3]>,
+    counters: HashMap<String, [ProviderCounters; PROVIDERS.len()]>,
     windows: HashMap<String, CoinWindow>,
 }
 
@@ -876,7 +884,7 @@ impl Benchmark {
             .filter(|(_, candidate)| candidate.arrivals[reference_provider.index()].is_some())
             .map(|(content, _)| content.clone())
             .collect::<HashSet<_>>();
-        let mut noncanonical_seen = [false; 3];
+        let mut noncanonical_seen = [false; PROVIDERS.len()];
         for (content, candidate) in &pending.candidates {
             if reference_content.contains(content) {
                 continue;
@@ -910,7 +918,7 @@ impl Benchmark {
         key: EventKey,
         candidate: PendingCandidate,
         now: Instant,
-        noncanonical_seen: [bool; 3],
+        noncanonical_seen: [bool; PROVIDERS.len()],
     ) {
         debug_assert!(
             candidate.arrivals[self.config.dataset.reference_provider().index()].is_some()
@@ -929,7 +937,7 @@ impl Benchmark {
         } else {
             now
         };
-        let mut outcomes = [CoverageOutcome::Missing; 3];
+        let mut outcomes = [CoverageOutcome::Missing; PROVIDERS.len()];
         let mut matched_mask = 0;
         for &provider in providers {
             let counters = self.counters_mut(provider, &key.coin);
@@ -966,7 +974,7 @@ impl Benchmark {
             }
         }
         if complete {
-            let mut latency_ms = [0; 3];
+            let mut latency_ms = [0; PROVIDERS.len()];
             for &provider in providers {
                 latency_ms[provider.index()] = candidate.arrivals[provider.index()]
                     .as_ref()
@@ -1162,6 +1170,7 @@ fn public_provider(provider: Provider) -> &'static str {
         Provider::FoundationWs => "hyperliquid",
         Provider::HydromancerWs => "hydromancer",
         Provider::QuickNodeGrpc => "quicknode",
+        Provider::QuickNodePeeringTcp => "quicknode",
     }
 }
 
@@ -1170,6 +1179,7 @@ fn public_source(provider: Provider) -> &'static str {
         Provider::FoundationWs => "hyperliquid-ws",
         Provider::HydromancerWs => "hydromancer-ws",
         Provider::QuickNodeGrpc => "quicknode-grpc",
+        Provider::QuickNodePeeringTcp => "quicknode-peering",
     }
 }
 
@@ -1276,6 +1286,19 @@ mod tests {
         })
     }
 
+    fn peering(event_ms: u64, wall_ms: u64, now: Instant, round: u64) -> ProbeEvent {
+        ProbeEvent::Market(MarketEvent {
+            provider: Provider::QuickNodePeeringTcp,
+            key: EventKey {
+                coin: "BLOCKS".to_owned(),
+                event_ms,
+                content: ContentKey::Peering { round },
+            },
+            received: now,
+            received_wall_ms: wall_ms,
+        })
+    }
+
     fn mempool(event_ms: u64, wall_ms: u64, now: Instant, tx_hash: &str) -> ProbeEvent {
         ProbeEvent::Market(MarketEvent {
             provider: Provider::QuickNodeGrpc,
@@ -1374,7 +1397,7 @@ mod tests {
     fn health_ages_use_actual_wall_time_not_the_aligned_label() {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(provider, 1_000, 1_100, now, "100"));
             signals.set_test_state(provider, "BTC", true, 89_998, 0);
         }
@@ -1413,7 +1436,7 @@ mod tests {
     fn concurrently_newer_stream_snapshots_are_fresh_with_zero_age() {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(provider, 1_000, 1_100, now, "100"));
         }
         settle_pending(&mut benchmark, now);
@@ -1430,7 +1453,7 @@ mod tests {
             healthy_clock(30_000),
         );
 
-        assert_eq!(events.len(), PROVIDERS.len());
+        assert_eq!(events.len(), BOOK_PROVIDERS.len());
         assert!(events.iter().all(|event| {
             event.cohort_complete
                 && !event.ready
@@ -1490,8 +1513,8 @@ mod tests {
 
             let ring = &benchmark.windows["BTC"].cohorts;
             assert_eq!(ring.len(), 1);
-            assert_eq!(ring[0].latency_ms, [200, 300, 100]);
-            for provider in PROVIDERS {
+            assert_eq!(ring[0].latency_ms, [200, 300, 100, 0]);
+            for provider in BOOK_PROVIDERS {
                 assert_eq!(benchmark.counters["BTC"][provider.index()].matched, 1);
             }
         }
@@ -1532,7 +1555,7 @@ mod tests {
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BTC"].cohorts[0].latency_ms,
-            [200, 0, 100]
+            [200, 0, 100, 0]
         );
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| {
@@ -1576,7 +1599,10 @@ mod tests {
 
         assert!(benchmark.pending.is_empty());
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
-        assert_eq!(benchmark.windows["BTC"].cohorts[0].latency_ms, [0, 0, 125]);
+        assert_eq!(
+            benchmark.windows["BTC"].cohorts[0].latency_ms,
+            [0, 0, 125, 0]
+        );
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.provider, "quicknode");
@@ -1602,6 +1628,74 @@ mod tests {
         let serialized = serde_json::to_string(event).unwrap();
         assert!(!serialized.contains("0xabc"));
         assert!(!serialized.contains("tx_hash"));
+    }
+
+    #[test]
+    fn peering_publishes_one_block_ready_row_and_counts_gaps_without_panicking() {
+        // Regression: the peering provider owns index 3; every per-provider array
+        // must be PROVIDERS-sized or the first recorded event panics.
+        let now = Instant::now();
+        let coins = vec!["BLOCKS".to_owned()];
+        let config = BenchmarkConfig::production(
+            Dataset::Peering,
+            coins.clone(),
+            "aws".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "aws-nrt-01".to_owned(),
+            "peering-run".to_owned(),
+        );
+        let mut benchmark = Benchmark::new(config, now, UNIX_EPOCH);
+        let signals = RuntimeSignals::new(&coins);
+
+        benchmark.record(peering(1_000, 1_150, now, 1_403_570_791));
+        benchmark.record(ProbeEvent::SequenceGap {
+            provider: Provider::QuickNodePeeringTcp,
+            coin: "BLOCKS".to_owned(),
+            missing: 2,
+        });
+        benchmark.record(ProbeEvent::Reconnect {
+            provider: Provider::QuickNodePeeringTcp,
+            coin: "BLOCKS".to_owned(),
+        });
+        signals.set_test_state(Provider::QuickNodePeeringTcp, "BLOCKS", true, 29_999, 0);
+
+        let events = benchmark.window_events(
+            now + Duration::from_secs(2),
+            UNIX_EPOCH + Duration::from_millis(30_000),
+            &signals,
+            IngestHealthSnapshot::default(),
+            healthy_clock(30_000),
+        );
+
+        assert_eq!(benchmark.windows["BLOCKS"].cohorts.len(), 1);
+        assert_eq!(
+            benchmark.windows["BLOCKS"].cohorts[0].latency_ms,
+            [0, 0, 0, 150]
+        );
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.provider, "quicknode");
+        assert_eq!(event.protocol, "tcp");
+        assert_eq!(event.source, "quicknode-peering");
+        assert_eq!(event.dataset, "peering");
+        assert_eq!(event.coin, "BLOCKS");
+        assert_eq!(event.schema, "hyperliquid-market-benchmark-v4");
+        assert_eq!(event.metric_kind, "block_time_to_block_ready");
+        assert_eq!(event.measurement_version, "peering-block-ready-v1");
+        assert_eq!(event.cohort, "quicknode-peering-tcp");
+        assert_eq!(event.sample_count, 1);
+        assert_eq!(event.p50_ms, Some(150.0));
+        assert_eq!(event.sequence_gaps, 2);
+        assert_eq!(event.reconnects, 1);
+        assert_eq!(event.outcome_count_scope, "not-applicable");
+        assert!(!event.outcome_interval_complete);
+        assert_eq!(event.outcome_quicknode_strict_fastest_count, 0);
+        assert_eq!(event.outcome_tie_count, 0);
+        // Round numbers are operational data, not identifiers, but keep the
+        // no-raw-payload posture: no hex-encoded signature or hash value is serialized.
+        let serialized = serde_json::to_string(event).unwrap();
+        assert!(!serialized.contains("0x"));
     }
 
     #[test]
@@ -1635,7 +1729,7 @@ mod tests {
     fn same_millisecond_book_revisions_are_two_distinct_cohorts() {
         let now = Instant::now();
         let (mut benchmark, _) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(provider, 1_000, 1_100, now, "100"));
             benchmark.record(book(provider, 1_000, 1_101, now, "200"));
         }
@@ -1670,7 +1764,7 @@ mod tests {
         benchmark.record(book(Provider::FoundationWs, 1_000, 1_100, now, "100"));
         settle_pending(&mut benchmark, now);
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(
                 provider,
                 1_000,
@@ -1683,13 +1777,14 @@ mod tests {
 
         assert!(benchmark.windows["BTC"].cohorts.is_empty());
         assert!(!benchmark.pending.contains_key(&BaseKey {
+            peering_round: None,
             coin: "BTC".to_owned(),
             event_ms: 1_000,
             trade_id: None,
             mempool_tx_hash: None,
         }));
         assert!(
-            PROVIDERS
+            BOOK_PROVIDERS
                 .iter()
                 .all(|provider| { benchmark.counters["BTC"][provider.index()].late == 1 })
         );
@@ -1726,7 +1821,7 @@ mod tests {
             let (mut benchmark, _) = config(now);
             let record_revision =
                 |benchmark: &mut Benchmark, received: Instant, px: &'static str| {
-                    for provider in PROVIDERS {
+                    for provider in BOOK_PROVIDERS {
                         benchmark.record(book(provider, 1_000, 1_100, received, px));
                     }
                 };
@@ -1746,20 +1841,20 @@ mod tests {
         for benchmark in [&late_then_early, &early_then_late] {
             let window = &benchmark.windows["BTC"];
             assert_eq!(window.cohorts.len(), 1);
-            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100]);
+            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100, 0]);
             assert_eq!(window.complete_cohorts, 1);
             assert_eq!(window.state_evictions, 0);
             assert_eq!(window.rolling_evictions, 0);
             assert_eq!(window.coverage_evictions, 0);
             assert_eq!(window.last_integrity_loss, None);
             assert_eq!(
-                unreported_outcomes(window, now + Duration::from_secs(3), &PROVIDERS).complete,
+                unreported_outcomes(window, now + Duration::from_secs(3), &BOOK_PROVIDERS).complete,
                 1
             );
             assert!(benchmark.pending.is_empty());
             assert_eq!(benchmark.settled_bases.len(), 1);
             assert_eq!(benchmark.settled.len(), 1);
-            for provider in PROVIDERS {
+            for provider in BOOK_PROVIDERS {
                 let counters = &benchmark.counters["BTC"][provider.index()];
                 assert_eq!(counters.observed, 2);
                 assert_eq!(counters.matched, 1);
@@ -1781,12 +1876,12 @@ mod tests {
             unreported_outcomes(
                 &late_then_early.windows["BTC"],
                 now + Duration::from_secs(3),
-                &PROVIDERS,
+                &BOOK_PROVIDERS,
             ),
             unreported_outcomes(
                 &early_then_late.windows["BTC"],
                 now + Duration::from_secs(3),
-                &PROVIDERS,
+                &BOOK_PROVIDERS,
             )
         );
     }
@@ -1795,10 +1890,10 @@ mod tests {
     fn replay_inside_the_rolling_window_cannot_duplicate_a_sample() {
         let now = Instant::now();
         let (mut benchmark, _) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(provider, 1_000, 1_100, now, "100"));
         }
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(
                 provider,
                 1_000,
@@ -1814,7 +1909,7 @@ mod tests {
     fn cross_task_processing_order_cannot_change_latest_or_pruning_order() {
         let now = Instant::now();
         let (mut benchmark, _) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(
                 provider,
                 2_000,
@@ -1823,7 +1918,7 @@ mod tests {
                 "200",
             ));
         }
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(
                 provider,
                 1_000,
@@ -1876,7 +1971,7 @@ mod tests {
         let (mut benchmark, _) = config(now);
         benchmark.config.max_rolling_cohorts = 1;
         for event_ms in [1_000, 2_000] {
-            for provider in PROVIDERS {
+            for provider in BOOK_PROVIDERS {
                 benchmark.record(book(provider, event_ms, event_ms + 100, now, "100"));
             }
         }
@@ -1896,7 +1991,7 @@ mod tests {
         let (mut benchmark, _) = config(now);
         benchmark.config.max_settled = 1;
         for event_ms in [1_000, 2_000] {
-            for provider in PROVIDERS {
+            for provider in BOOK_PROVIDERS {
                 benchmark.record(book(provider, event_ms, event_ms + 100, now, "100"));
             }
         }
@@ -1910,7 +2005,7 @@ mod tests {
     fn published_contract_has_three_equal_cohort_sample_counts() {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(provider, 1_000, 1_100, now, "100"));
         }
         settle_pending(&mut benchmark, now);
@@ -1981,11 +2076,11 @@ mod tests {
     fn outcome_intervals_are_non_overlapping_and_never_count_a_cohort_twice() {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 29_000, 0);
         }
         let first_latencies = [200, 300, 100];
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(
                 provider,
                 1_000,
@@ -2013,11 +2108,11 @@ mod tests {
         }));
         assert!(benchmark.commit_prepared_publication());
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 59_000, 0);
         }
         let second_latencies = [300, 100, 200];
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(
                 provider,
                 2_000,
@@ -2043,7 +2138,7 @@ mod tests {
         assert_ne!(first[0].outcome_interval_id, second[0].outcome_interval_id);
         assert!(benchmark.commit_prepared_publication());
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 89_000, 0);
         }
         let third = benchmark.window_events(
@@ -2068,7 +2163,7 @@ mod tests {
     fn rejected_durable_submission_retains_outcomes_for_a_transparent_retry() {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(
                 provider,
                 1_000,
@@ -2098,7 +2193,7 @@ mod tests {
                 .all(|cohort| !cohort.outcome_reported)
         );
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 59_000, 0);
         }
         let retry = benchmark.window_events(
@@ -2128,7 +2223,7 @@ mod tests {
                 .all(|cohort| cohort.outcome_reported)
         );
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 89_000, 0);
         }
         let next = benchmark.window_events(
@@ -2149,7 +2244,7 @@ mod tests {
     fn outcome_counts_distinguish_strict_fastest_from_two_and_three_way_ties() {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 29_000, 0);
         }
         for (index, latencies) in [[200, 300, 100], [200, 100, 100], [100, 100, 100]]
@@ -2157,7 +2252,7 @@ mod tests {
             .enumerate()
         {
             let event_ms = (index as u64 + 1) * 1_000;
-            for provider in PROVIDERS {
+            for provider in BOOK_PROVIDERS {
                 benchmark.record(book(
                     provider,
                     event_ms,
@@ -2197,12 +2292,12 @@ mod tests {
     fn rolling_source_dispersion_is_population_standard_deviation_and_p99_p50_spread() {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 29_000, 0);
         }
         for (index, latencies) in [[100, 200, 300], [300, 400, 500]].into_iter().enumerate() {
             let event_ms = (index as u64 + 1) * 1_000;
-            for provider in PROVIDERS {
+            for provider in BOOK_PROVIDERS {
                 benchmark.record(book(
                     provider,
                     event_ms,
@@ -2270,7 +2365,7 @@ mod tests {
     fn queue_drop_and_clock_rejection_invalidate_the_whole_cohort_window() {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(provider, 1_000, 1_100, now, "100"));
             signals.set_test_state(provider, "BTC", true, 29_000, 0);
         }
@@ -2299,7 +2394,7 @@ mod tests {
         );
         signals.set_test_state(Provider::HydromancerWs, "BTC", true, 59_000, 0);
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 89_000, 0);
         }
         signals.set_test_state(Provider::FoundationWs, "BTC", true, 89_000, 89_500);
@@ -2317,7 +2412,7 @@ mod tests {
                 .all(|event| event.readiness == "integrity-gap")
         );
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 119_000, 0);
         }
         benchmark.record(book(
@@ -2341,7 +2436,7 @@ mod tests {
     fn runtime_clock_health_gates_absolute_latency_and_interval_evidence() {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             benchmark.record(book(provider, 1_000, 1_100, now, "100"));
             signals.set_test_state(provider, "BTC", true, 29_000, 0);
         }
@@ -2356,7 +2451,7 @@ mod tests {
         assert!(first.iter().all(|event| event.cohort_complete));
         assert!(benchmark.commit_prepared_publication());
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 59_000, 0);
         }
         let mut unsynchronized = healthy_clock(60_000);
@@ -2376,7 +2471,7 @@ mod tests {
         }));
         assert!(benchmark.commit_prepared_publication());
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 89_000, 0);
         }
         let mut excessive_offset = healthy_clock(90_000);
@@ -2395,7 +2490,7 @@ mod tests {
         }));
         assert!(benchmark.commit_prepared_publication());
 
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 119_000, 0);
         }
         let mut boundary = healthy_clock(120_000);
@@ -2420,7 +2515,7 @@ mod tests {
         let now = Instant::now();
         let (mut benchmark, signals) = config(now);
         benchmark.config.artifact_sha256 = "a".repeat(64);
-        for provider in PROVIDERS {
+        for provider in BOOK_PROVIDERS {
             signals.set_test_state(provider, "BTC", true, 29_000, 0);
         }
         let events = benchmark.window_events(

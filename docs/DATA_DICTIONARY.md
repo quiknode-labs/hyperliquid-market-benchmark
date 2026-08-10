@@ -52,6 +52,20 @@ consumer must not replace an omitted value with zero.
 | `coverage_count_scope` | string | `rolling-window` for coverage counts. |
 | `health_count_scope` | string | `run-lifetime` for cumulative health counters. |
 
+
+### Peering dataset notes
+
+- `dataset` is `peering`, `coin` is the pinned label `BLOCKS` (consensus
+  blocks, not a market), `provider` is `quicknode`, `protocol` is `tcp`, and
+  `source`/`cohort` are `quicknode-peering`/`quicknode-peering-tcp`.
+- `schema` is `hyperliquid-market-benchmark-v4` and `measurement_version` is
+  `peering-block-ready-v1`.
+- `sequence_gaps` counts consensus rounds that failed to complete (ordering or
+  referenced bundle content missing) within the cohort deadline — the stream
+  completeness signal. `matched_count` counts complete block-ready samples.
+- One-source dataset: `outcome_count_scope` is `not-applicable` and every
+  fastest/tie count is zero by construction.
+
 ## Rolling distribution
 
 | Field | Type | Meaning |

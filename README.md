@@ -21,6 +21,13 @@ subscribes to `MEMPOOL_TXS` through `StreamData` with the production
 same pre-consensus bundle and first-seen timestamp, so mempool is an absolute
 delivery measurement rather than a provider race.
 
+The `peering` dataset measures the Quicknode peering service: absolute
+delivery latency and completeness of Hyperliquid consensus blocks over a plain
+TCP gossip subscription on the anonymous public tier (fixed, disclosed release
+delay included). It is a one-source absolute measurement like mempool; block
+producer timestamps and bundle identities come from a reference feed of
+deterministic chain data reproducible from any node's replay output.
+
 The benchmark reports absolute delivery latency, not a race delta, synthetic
 score, order-to-fill latency, or matching-engine execution time:
 
@@ -28,6 +35,7 @@ score, order-to-fill latency, or matching-engine execution time:
 books: local canonical-book-ready wall clock - Hyperliquid event timestamp
 fills: local canonical-trade-ready wall clock - Hyperliquid trade timestamp
 mempool: local decoded-bundle-ready wall clock - embedded first-seen timestamp
+peering: local block-ready wall clock - block producer timestamp
 ```
 
 Each path is timestamped after its dataset-specific transport decoding and

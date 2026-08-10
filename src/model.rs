@@ -6,14 +6,20 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use clap::ValueEnum;
 use tokio::sync::mpsc;
 
-pub const PROVIDERS: [Provider; 3] = [
+pub const PROVIDERS: [Provider; 4] = [
+    Provider::FoundationWs,
+    Provider::HydromancerWs,
+    Provider::QuickNodeGrpc,
+    Provider::QuickNodePeeringTcp,
+];
+pub const BOOK_PROVIDERS: [Provider; 3] = [
     Provider::FoundationWs,
     Provider::HydromancerWs,
     Provider::QuickNodeGrpc,
 ];
-pub const BOOK_PROVIDERS: [Provider; 3] = PROVIDERS;
 pub const FILLS_PROVIDERS: [Provider; 2] = [Provider::FoundationWs, Provider::QuickNodeGrpc];
 pub const MEMPOOL_PROVIDERS: [Provider; 1] = [Provider::QuickNodeGrpc];
+pub const PEERING_PROVIDERS: [Provider; 1] = [Provider::QuickNodePeeringTcp];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum Dataset {
@@ -21,6 +27,7 @@ pub enum Dataset {
     L2book,
     Fills,
     Mempool,
+    Peering,
 }
 
 impl Dataset {
@@ -30,6 +37,7 @@ impl Dataset {
             Self::L2book => "l2Book",
             Self::Fills => "trades",
             Self::Mempool => "mempool_txs",
+            Self::Peering => "gossip_blocks",
         }
     }
 
@@ -39,6 +47,7 @@ impl Dataset {
             Self::L2book => "l2book",
             Self::Fills => "fills",
             Self::Mempool => "mempool",
+            Self::Peering => "peering",
         }
     }
 
@@ -47,6 +56,7 @@ impl Dataset {
             Self::Bbo | Self::L2book => &BOOK_PROVIDERS,
             Self::Fills => &FILLS_PROVIDERS,
             Self::Mempool => &MEMPOOL_PROVIDERS,
+            Self::Peering => &PEERING_PROVIDERS,
         }
     }
 
@@ -55,6 +65,7 @@ impl Dataset {
             Self::Bbo | Self::L2book => "hyperliquid-market-benchmark-v1",
             Self::Fills => "hyperliquid-market-benchmark-v2",
             Self::Mempool => "hyperliquid-market-benchmark-v3",
+            Self::Peering => "hyperliquid-market-benchmark-v4",
         }
     }
 
@@ -63,6 +74,7 @@ impl Dataset {
             Self::Bbo | Self::L2book => "event_to_canonical_book_ready",
             Self::Fills => "event_to_canonical_trade_ready",
             Self::Mempool => "mempool_first_seen_to_bundle_ready",
+            Self::Peering => "block_time_to_block_ready",
         }
     }
 
@@ -71,6 +83,7 @@ impl Dataset {
             Self::Bbo | Self::L2book => "canonical-book-ready-v1",
             Self::Fills => "canonical-trade-ready-v1",
             Self::Mempool => "mempool-bundle-ready-v1",
+            Self::Peering => "peering-block-ready-v1",
         }
     }
 
@@ -79,6 +92,7 @@ impl Dataset {
             Self::Bbo | Self::L2book => "hyperliquid-ws+hydromancer-ws+quicknode-grpc",
             Self::Fills => "hyperliquid-ws+quicknode-grpc",
             Self::Mempool => "quicknode-grpc",
+            Self::Peering => "quicknode-peering-tcp",
         }
     }
 
@@ -86,11 +100,12 @@ impl Dataset {
         match self {
             Self::Bbo | Self::L2book | Self::Fills => Provider::FoundationWs,
             Self::Mempool => Provider::QuickNodeGrpc,
+            Self::Peering => Provider::QuickNodePeeringTcp,
         }
     }
 
     pub const fn has_provider_comparison(self) -> bool {
-        !matches!(self, Self::Mempool)
+        !matches!(self, Self::Mempool | Self::Peering)
     }
 }
 
@@ -99,6 +114,7 @@ pub enum Provider {
     FoundationWs,
     HydromancerWs,
     QuickNodeGrpc,
+    QuickNodePeeringTcp,
 }
 
 impl Provider {
@@ -107,6 +123,7 @@ impl Provider {
             Self::FoundationWs => 0,
             Self::HydromancerWs => 1,
             Self::QuickNodeGrpc => 2,
+            Self::QuickNodePeeringTcp => 3,
         }
     }
 
@@ -115,6 +132,7 @@ impl Provider {
             Self::FoundationWs => "foundation-ws",
             Self::HydromancerWs => "hydromancer-ws",
             Self::QuickNodeGrpc => "quicknode-grpc",
+            Self::QuickNodePeeringTcp => "quicknode-peering",
         }
     }
 
@@ -122,6 +140,7 @@ impl Provider {
         match self {
             Self::FoundationWs | Self::HydromancerWs => "ws",
             Self::QuickNodeGrpc => "grpc",
+            Self::QuickNodePeeringTcp => "tcp",
         }
     }
 }
@@ -140,11 +159,24 @@ impl EventKey {
             event_ms: self.event_ms,
             trade_id: match &self.content {
                 ContentKey::Trade { tid, .. } => Some(*tid),
-                ContentKey::Bbo { .. } | ContentKey::L2 { .. } | ContentKey::Mempool { .. } => None,
+                ContentKey::Bbo { .. }
+                | ContentKey::L2 { .. }
+                | ContentKey::Mempool { .. }
+                | ContentKey::Peering { .. } => None,
             },
             mempool_tx_hash: match &self.content {
                 ContentKey::Mempool { tx_hash } => Some(tx_hash.clone()),
-                ContentKey::Bbo { .. } | ContentKey::L2 { .. } | ContentKey::Trade { .. } => None,
+                ContentKey::Bbo { .. }
+                | ContentKey::L2 { .. }
+                | ContentKey::Trade { .. }
+                | ContentKey::Peering { .. } => None,
+            },
+            peering_round: match &self.content {
+                ContentKey::Peering { round } => Some(*round),
+                ContentKey::Bbo { .. }
+                | ContentKey::L2 { .. }
+                | ContentKey::Trade { .. }
+                | ContentKey::Mempool { .. } => None,
             },
         }
     }
@@ -156,6 +188,7 @@ pub struct BaseKey {
     pub event_ms: u64,
     pub trade_id: Option<u64>,
     pub mempool_tx_hash: Option<String>,
+    pub peering_round: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -178,6 +211,9 @@ pub enum ContentKey {
     },
     Mempool {
         tx_hash: String,
+    },
+    Peering {
+        round: u64,
     },
 }
 

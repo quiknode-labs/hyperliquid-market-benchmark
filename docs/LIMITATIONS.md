@@ -45,3 +45,17 @@
   downtime.
 - Public runner IDs identify cloud, logical region, and physical metro, not an
   exact host, availability zone, IP address, or customer tenant.
+- Peering is a one-source Quicknode measurement; no public comparator exposes
+  the raw gossip block stream. It cannot support a fastest-provider share.
+- The block producer timestamp is supplied by the block's proposer. Proposer
+  clock error affects every peering sample; the collector cannot correct it.
+- Peering latency includes the anonymous public tier's fixed release delay,
+  disclosed on the dashboard. It measures that product tier as offered.
+- The peering reference feed is derived from a Hyperliquid node's replay
+  output. It is deterministic chain data reproducible by any node operator,
+  but a stalled feed delays sample settlement and surfaces as incomplete
+  rounds, not as latency.
+- Quicknode operates both the measured peering service and the benchmark. The
+  dataset carries that disclosure wherever it is rendered.
+- A peering sample measures delivery of raw consensus data only; it says
+  nothing about execution, application state, or order lifecycle latency.
