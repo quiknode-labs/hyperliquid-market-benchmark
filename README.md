@@ -23,8 +23,9 @@ delivery measurement rather than a provider race.
 
 The `peering` dataset measures the Quicknode peering service: absolute
 delivery latency and completeness of Hyperliquid consensus blocks over a plain
-TCP gossip subscription on the anonymous public tier (fixed, disclosed release
-delay included). It is a one-source absolute measurement like mempool; block
+TCP gossip subscription, connected as a provisioned peering customer
+receiving the full-speed stream. It is a one-source absolute measurement like
+mempool; block
 producer timestamps and bundle identities come from a reference feed of
 deterministic chain data reproducible from any node's replay output.
 

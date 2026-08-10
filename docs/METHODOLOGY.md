@@ -105,12 +105,11 @@ distinct bundles first seen within the same millisecond remain distinct samples.
 
 The `peering` dataset measures one path: a plain TCP subscriber connected to a
 Quicknode peering service endpoint, consuming Hyperliquid's native gossip wire
-stream exactly as any peered node would. The subscription uses the anonymous
-public tier — any node operator who discovers the endpoint through normal
-Hyperliquid gossip can connect with no registration — which applies a fixed,
-disclosed release delay (currently 500 ms) to live data. The collector
-connects exactly that way, so the delay is part of the measurement and is
-stated on the dashboard, never subtracted. No other public source exposes the
+stream exactly as any peered node would. The collector connects as a
+provisioned peering customer: its observer source addresses are registered
+with the service and it receives the full-speed stream, so every published
+value is the delivery latency a peering customer experiences — no synthetic
+allowances in either direction. No other public source exposes the
 raw gossip block stream with the producer timestamp, so peering, like mempool,
 is an absolute delivery measurement with no fastest-provider share.
 
