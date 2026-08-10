@@ -7,7 +7,8 @@ use serde::Serialize;
 use crate::axiom::IngestHealthSnapshot;
 use crate::clock::ClockHealthSnapshot;
 use crate::model::{
-    BaseKey, ContentKey, Dataset, EventKey, MarketEvent, ProbeEvent, Provider, RuntimeSignals,
+    BaseKey, ContentKey, Dataset, EventKey, MarketEvent, PROVIDERS, ProbeEvent, Provider,
+    RuntimeSignals,
 };
 
 #[cfg(test)]
@@ -152,7 +153,7 @@ struct Observation {
 
 struct PendingCandidate {
     first_observed: Instant,
-    arrivals: [Option<Observation>; 3],
+    arrivals: [Option<Observation>; PROVIDERS.len()],
 }
 
 impl PendingCandidate {
@@ -187,7 +188,7 @@ struct SettledCohort {
 struct CommittedCohort {
     committed_at: Instant,
     event_ms: u64,
-    latency_ms: [u64; 3],
+    latency_ms: [u64; PROVIDERS.len()],
     commit_delay_ms: u64,
     outcome_reported: bool,
 }
@@ -202,7 +203,7 @@ enum CoverageOutcome {
 #[derive(Debug, Clone)]
 struct CoverageCohort {
     settled_at: Instant,
-    outcomes: [CoverageOutcome; 3],
+    outcomes: [CoverageOutcome; PROVIDERS.len()],
 }
 
 #[derive(Default)]
@@ -359,8 +360,8 @@ struct Distribution {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct OutcomeCounts {
     complete: u64,
-    strict_fastest: [u64; 3],
-    tied_fastest: [u64; 3],
+    strict_fastest: [u64; PROVIDERS.len()],
+    tied_fastest: [u64; PROVIDERS.len()],
     ties: u64,
 }
 
@@ -380,7 +381,7 @@ pub struct Benchmark {
     pending: HashMap<BaseKey, PendingBase>,
     settled_bases: HashMap<BaseKey, Instant>,
     settled: HashMap<EventKey, SettledCohort>,
-    counters: HashMap<String, [ProviderCounters; 3]>,
+    counters: HashMap<String, [ProviderCounters; PROVIDERS.len()]>,
     windows: HashMap<String, CoinWindow>,
 }
 
@@ -883,7 +884,7 @@ impl Benchmark {
             .filter(|(_, candidate)| candidate.arrivals[reference_provider.index()].is_some())
             .map(|(content, _)| content.clone())
             .collect::<HashSet<_>>();
-        let mut noncanonical_seen = [false; 3];
+        let mut noncanonical_seen = [false; PROVIDERS.len()];
         for (content, candidate) in &pending.candidates {
             if reference_content.contains(content) {
                 continue;
@@ -917,7 +918,7 @@ impl Benchmark {
         key: EventKey,
         candidate: PendingCandidate,
         now: Instant,
-        noncanonical_seen: [bool; 3],
+        noncanonical_seen: [bool; PROVIDERS.len()],
     ) {
         debug_assert!(
             candidate.arrivals[self.config.dataset.reference_provider().index()].is_some()
@@ -936,7 +937,7 @@ impl Benchmark {
         } else {
             now
         };
-        let mut outcomes = [CoverageOutcome::Missing; 3];
+        let mut outcomes = [CoverageOutcome::Missing; PROVIDERS.len()];
         let mut matched_mask = 0;
         for &provider in providers {
             let counters = self.counters_mut(provider, &key.coin);
@@ -973,7 +974,7 @@ impl Benchmark {
             }
         }
         if complete {
-            let mut latency_ms = [0; 3];
+            let mut latency_ms = [0; PROVIDERS.len()];
             for &provider in providers {
                 latency_ms[provider.index()] = candidate.arrivals[provider.index()]
                     .as_ref()
@@ -1285,6 +1286,19 @@ mod tests {
         })
     }
 
+    fn peering(event_ms: u64, wall_ms: u64, now: Instant, round: u64) -> ProbeEvent {
+        ProbeEvent::Market(MarketEvent {
+            provider: Provider::QuickNodePeeringTcp,
+            key: EventKey {
+                coin: "BLOCKS".to_owned(),
+                event_ms,
+                content: ContentKey::Peering { round },
+            },
+            received: now,
+            received_wall_ms: wall_ms,
+        })
+    }
+
     fn mempool(event_ms: u64, wall_ms: u64, now: Instant, tx_hash: &str) -> ProbeEvent {
         ProbeEvent::Market(MarketEvent {
             provider: Provider::QuickNodeGrpc,
@@ -1499,7 +1513,7 @@ mod tests {
 
             let ring = &benchmark.windows["BTC"].cohorts;
             assert_eq!(ring.len(), 1);
-            assert_eq!(ring[0].latency_ms, [200, 300, 100]);
+            assert_eq!(ring[0].latency_ms, [200, 300, 100, 0]);
             for provider in BOOK_PROVIDERS {
                 assert_eq!(benchmark.counters["BTC"][provider.index()].matched, 1);
             }
@@ -1541,7 +1555,7 @@ mod tests {
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BTC"].cohorts[0].latency_ms,
-            [200, 0, 100]
+            [200, 0, 100, 0]
         );
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| {
@@ -1585,7 +1599,10 @@ mod tests {
 
         assert!(benchmark.pending.is_empty());
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
-        assert_eq!(benchmark.windows["BTC"].cohorts[0].latency_ms, [0, 0, 125]);
+        assert_eq!(
+            benchmark.windows["BTC"].cohorts[0].latency_ms,
+            [0, 0, 125, 0]
+        );
         assert_eq!(events.len(), 1);
         let event = &events[0];
         assert_eq!(event.provider, "quicknode");
@@ -1611,6 +1628,74 @@ mod tests {
         let serialized = serde_json::to_string(event).unwrap();
         assert!(!serialized.contains("0xabc"));
         assert!(!serialized.contains("tx_hash"));
+    }
+
+    #[test]
+    fn peering_publishes_one_block_ready_row_and_counts_gaps_without_panicking() {
+        // Regression: the peering provider owns index 3; every per-provider array
+        // must be PROVIDERS-sized or the first recorded event panics.
+        let now = Instant::now();
+        let coins = vec!["BLOCKS".to_owned()];
+        let config = BenchmarkConfig::production(
+            Dataset::Peering,
+            coins.clone(),
+            "aws".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "aws-nrt-01".to_owned(),
+            "peering-run".to_owned(),
+        );
+        let mut benchmark = Benchmark::new(config, now, UNIX_EPOCH);
+        let signals = RuntimeSignals::new(&coins);
+
+        benchmark.record(peering(1_000, 1_150, now, 1_403_570_791));
+        benchmark.record(ProbeEvent::SequenceGap {
+            provider: Provider::QuickNodePeeringTcp,
+            coin: "BLOCKS".to_owned(),
+            missing: 2,
+        });
+        benchmark.record(ProbeEvent::Reconnect {
+            provider: Provider::QuickNodePeeringTcp,
+            coin: "BLOCKS".to_owned(),
+        });
+        signals.set_test_state(Provider::QuickNodePeeringTcp, "BLOCKS", true, 29_999, 0);
+
+        let events = benchmark.window_events(
+            now + Duration::from_secs(2),
+            UNIX_EPOCH + Duration::from_millis(30_000),
+            &signals,
+            IngestHealthSnapshot::default(),
+            healthy_clock(30_000),
+        );
+
+        assert_eq!(benchmark.windows["BLOCKS"].cohorts.len(), 1);
+        assert_eq!(
+            benchmark.windows["BLOCKS"].cohorts[0].latency_ms,
+            [0, 0, 0, 150]
+        );
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.provider, "quicknode");
+        assert_eq!(event.protocol, "tcp");
+        assert_eq!(event.source, "quicknode-peering");
+        assert_eq!(event.dataset, "peering");
+        assert_eq!(event.coin, "BLOCKS");
+        assert_eq!(event.schema, "hyperliquid-market-benchmark-v4");
+        assert_eq!(event.metric_kind, "block_time_to_block_ready");
+        assert_eq!(event.measurement_version, "peering-block-ready-v1");
+        assert_eq!(event.cohort, "quicknode-peering-tcp");
+        assert_eq!(event.sample_count, 1);
+        assert_eq!(event.p50_ms, Some(150.0));
+        assert_eq!(event.sequence_gaps, 2);
+        assert_eq!(event.reconnects, 1);
+        assert_eq!(event.outcome_count_scope, "not-applicable");
+        assert!(!event.outcome_interval_complete);
+        assert_eq!(event.outcome_quicknode_strict_fastest_count, 0);
+        assert_eq!(event.outcome_tie_count, 0);
+        // Round numbers are operational data, not identifiers, but keep the
+        // no-raw-payload posture: no hex-encoded signature or hash value is serialized.
+        let serialized = serde_json::to_string(event).unwrap();
+        assert!(!serialized.contains("0x"));
     }
 
     #[test]
@@ -1756,7 +1841,7 @@ mod tests {
         for benchmark in [&late_then_early, &early_then_late] {
             let window = &benchmark.windows["BTC"];
             assert_eq!(window.cohorts.len(), 1);
-            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100]);
+            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100, 0]);
             assert_eq!(window.complete_cohorts, 1);
             assert_eq!(window.state_evictions, 0);
             assert_eq!(window.rolling_evictions, 0);
