@@ -24,7 +24,8 @@ event.
 Required secrets:
 
 - `HYDROMANCER_API_KEY` (required for BBO and L2Book; not required for fills or mempool)
-- `QUICKNODE_HYPERLIQUID_TOKEN`
+- `QUICKNODE_HYPERLIQUID_TOKEN` (not required for peering, which subscribes to
+  the anonymous public tier and has no credential)
 - `AXIOM_API_TOKEN` (dataset-scoped ingest token)
 
 Required public Quicknode endpoint configuration:
@@ -33,6 +34,15 @@ Required public Quicknode endpoint configuration:
   `*.hype-mainnet.quiknode.pro:10000` origin. Direct, internal, plaintext,
   testnet, and wrong-port origins are refused.
 
+Required peering configuration (peering processes only):
+
+- `QUICKNODE_PEERING_ENDPOINT`, a bare `host:port` with no scheme or
+  credentials — the public peering service address.
+- `PEERING_REFERENCE_FEED`, a bare `host:port` serving the NDJSON block
+  reference feed (deterministic chain data reproducible from any Hyperliquid
+  node's replay output; see METHODOLOGY). A stalled feed surfaces as
+  incomplete rounds via `sequence_gaps`, never as latency.
+
 Required public observer configuration:
 
 - `BENCHMARK_RUNNER_ID`
@@ -40,7 +50,7 @@ Required public observer configuration:
 - `BENCHMARK_REGION`
 - `BENCHMARK_METRO`
 
-Keep BBO, L2Book, fills, and mempool in separate service processes. Run as an
+Keep BBO, L2Book, fills, mempool, and peering in separate service processes. Run as an
 unprivileged user, restrict the writable filesystem to the outbox directory,
 and set a restart policy. Never pass secrets in CLI arguments.
 
@@ -56,15 +66,16 @@ regression.
 
 ## Canary proof
 
-Before a fleet rollout, prove `bbo`, `l2book`, `fills`, and the opt-in `mempool`
-process on one observer:
+Before a fleet rollout, prove `bbo`, `l2book`, `fills`, and the opt-in
+`mempool` and `peering` processes on one observer:
 
 1. every process remains active and keeps its expected persistent connections
-   (three for books, two for fills, one for mempool);
+   (three for books, two for fills, one for mempool, and for peering one
+   subscription plus its reference-feed connection);
 2. runtime clock health is valid;
 3. outbox files are acknowledged and removed without drops;
 4. Axiom contains exactly three provider rows per book window, two per fills
-   window, and one per mempool window;
+   window, and one per mempool or peering window;
 5. all rows agree on runner, run, window, interval outcome, and sample count;
 6. P50 <= P95 <= P99 and no negative/zero placeholder is synthesized;
 7. a deliberate credential failure is visible and recovers without data
