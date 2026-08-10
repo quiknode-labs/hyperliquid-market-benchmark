@@ -24,8 +24,9 @@ event.
 Required secrets:
 
 - `HYDROMANCER_API_KEY` (required for BBO and L2Book; not required for fills or mempool)
-- `QUICKNODE_HYPERLIQUID_TOKEN` (not required for peering, which subscribes to
-  the anonymous public tier and has no credential)
+- `QUICKNODE_HYPERLIQUID_TOKEN` (not required for peering, whose subscription
+  is authorized by the observer's registered source address and carries no
+  credential)
 - `AXIOM_API_TOKEN` (dataset-scoped ingest token)
 
 Required public Quicknode endpoint configuration:

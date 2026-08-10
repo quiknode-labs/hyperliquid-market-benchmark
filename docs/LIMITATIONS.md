@@ -49,8 +49,10 @@
   the raw gossip block stream. It cannot support a fastest-provider share.
 - The block producer timestamp is supplied by the block's proposer. Proposer
   clock error affects every peering sample; the collector cannot correct it.
-- Peering latency includes the anonymous public tier's fixed release delay,
-  disclosed on the dashboard. It measures that product tier as offered.
+- Peering measures the provisioned service tier: the collector's observer
+  addresses are registered with the service and receive the full-speed
+  stream. It is the latency a peering customer experiences, not the delayed
+  public tier offered to unregistered nodes.
 - The peering reference feed is derived from a Hyperliquid node's replay
   output. It is deterministic chain data reproducible by any node operator,
   but a stalled feed delays sample settlement and surfaces as incomplete
