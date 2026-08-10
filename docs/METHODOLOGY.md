@@ -100,6 +100,51 @@ transaction hashes remain in bounded process memory only and are never written
 to the outbox or Axiom. The in-memory identity includes the transaction hash so
 distinct bundles first seen within the same millisecond remain distinct samples.
 
+
+## Peering block readiness
+
+The `peering` dataset measures one path: a plain TCP subscriber connected to a
+Quicknode peering service endpoint, consuming Hyperliquid's native gossip wire
+stream exactly as any peered node would. The subscription uses the anonymous
+public tier — any node operator who discovers the endpoint through normal
+Hyperliquid gossip can connect with no registration — which applies a fixed,
+disclosed release delay (currently 500 ms) to live data. The collector
+connects exactly that way, so the delay is part of the measurement and is
+stated on the dashboard, never subtracted. No other public source exposes the
+raw gossip block stream with the producer timestamp, so peering, like mempool,
+is an absolute delivery measurement with no fastest-provider share.
+
+A block is **ready** when its ordering record has been received and parsed
+(consensus round plus the list of referenced transaction bundles) and every
+referenced bundle has been received, decompressed, and validated. The observer
+wall-clock timestamp is captured at the last required arrival, before the
+bounded event queue, so transport, framing, decompression, and validation are
+included consistently with the other datasets.
+
+```text
+peering: observer block-ready UTC - block producer timestamp
+```
+
+Two per-round facts are not decodable from the wire and come from a reference
+feed instead: the block's producer timestamp, and each referenced bundle's
+leading signature value, which the collector matches against the first record
+of each wire bundle. Both facts are deterministic chain data — every
+Hyperliquid node's replay output records them byte-identically — so anyone can
+reproduce the reference feed from any node. Arrival timestamps are always
+captured live at the socket; the reference feed only closes a sample after the
+fact, so feed lag delays reporting but never distorts a latency value. One
+consensus round contributes at most one sample; a round that does not complete
+within the five-second cohort deadline is counted through `sequence_gaps`
+rather than guessed, and can never enter a latency distribution late.
+
+Peering measures consensus blocks rather than a market, so the process
+contract pins the coin label `BLOCKS`. Hyperliquid produces roughly fifteen
+rounds per second, comfortably inside the mempool-class state limits, and the
+1,000-sample P99 gate is reached in under two minutes of healthy stream.
+Quicknode operates both the measured service and this benchmark; the dataset
+is published with that disclosure, and readers who require an adversarial
+measurement can reproduce it with this collector from their own vantage.
+
 ## Reference and admission sets
 
 For BBO, L2Book, and fills, Foundation defines the reference event universe used

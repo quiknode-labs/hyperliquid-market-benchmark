@@ -4,6 +4,23 @@ All notable changes to the collector and measurement contract are documented
 here. Versions follow Semantic Versioning; measurement-contract changes are
 also identified independently in emitted events.
 
+## 0.4.0 - 2026-08-10
+
+- Add the `peering` dataset: absolute delivery latency and completeness of
+  Hyperliquid consensus blocks over a plain TCP subscription to the Quicknode
+  peering service's anonymous public tier (fixed, disclosed release delay).
+- A block is ready when its ordering record and every referenced transaction
+  bundle have arrived and decoded (`peering-block-ready-v1`,
+  `hyperliquid-market-benchmark-v4`). Producer timestamps and bundle
+  identities come from a reference feed of deterministic chain data
+  reproducible from any Hyperliquid node's replay output.
+- Rounds that do not complete within the cohort deadline are counted through
+  `sequence_gaps`, never guessed; one-source dataset, so
+  `outcome_count_scope=not-applicable` and no fastest-provider share.
+- The process contract pins `--coins BLOCKS` and reads
+  `QUICKNODE_PEERING_ENDPOINT` / `PEERING_REFERENCE_FEED`; no gRPC token is
+  required for a peering-only process.
+
 ## 0.3.0 - 2026-07-30
 
 - Add the `mempool` dataset as a single-source BTC pre-consensus delivery
