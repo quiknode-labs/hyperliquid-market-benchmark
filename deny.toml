@@ -6,7 +6,11 @@ targets = [
 all-features = true
 
 [advisories]
-ignore = []
+# RUSTSEC-2026-0235 (rkyv 0.7.46): reachable only through rust_decimal's
+# never-enabled optional feature (checked here with all-features, hence
+# visible); not compiled into any shipped artifact. Same rationale as
+# .cargo/audit.toml — remove both when rust_decimal drops the integration.
+ignore = [{ id = "RUSTSEC-2026-0235", reason = "unused optional rust_decimal feature; not in any build" }]
 
 [licenses]
 confidence-threshold = 0.8
