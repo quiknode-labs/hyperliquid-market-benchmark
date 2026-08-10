@@ -1,0 +1,9 @@
+[advisories]
+# RUSTSEC-2026-0235 (rkyv 0.7.46): rkyv enters the lockfile only as an
+# UNUSED optional feature of rust_decimal (its `rkyv` feature is never
+# enabled here) and is not compiled into any artifact — `cargo tree -i rkyv`
+# resolves to nothing on every build target. rust_decimal 1.42.1 is the
+# newest release and still declares the optional rkyv 0.7 dependency, so the
+# lockfile entry cannot be removed by updating. Remove this exception when
+# rust_decimal drops or upgrades its optional rkyv integration.
+ignore = ["RUSTSEC-2026-0235"]
