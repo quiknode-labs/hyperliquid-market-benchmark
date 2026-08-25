@@ -88,20 +88,27 @@ def main():
     handle = None
     buffer = b""
     while True:
-        latest = newest_file()
-        if latest is None:
-            time.sleep(1)
-            continue
-        if latest != path:
-            if handle:
-                handle.close()
-            path = latest
+        if handle is None:
+            path = newest_file()
+            if path is None:
+                time.sleep(1)
+                continue
             handle = open(path, "rb")
+            # Live tail only at startup; rotated files are read from the start.
             handle.seek(0, 2)
             buffer = b""
         chunk = handle.read()
         if not chunk:
-            time.sleep(0.02)
+            # Only rotate once the current file is fully drained, so the tail
+            # of the finished file is never dropped.
+            latest = newest_file()
+            if latest is not None and latest != path:
+                handle.close()
+                path = latest
+                handle = open(path, "rb")
+                buffer = b""
+            else:
+                time.sleep(0.02)
             continue
         buffer += chunk
         while b"\n" in buffer:

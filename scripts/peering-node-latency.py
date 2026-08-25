@@ -38,22 +38,36 @@ def parse_time(text):
 
 def capture(base, duration):
     def newest():
-        sess = os.path.join(base, sorted(os.listdir(base))[-1])
-        day = os.path.join(sess, sorted(os.listdir(sess))[-1])
-        return os.path.join(day, sorted(os.listdir(day), key=int)[-1])
+        # A day rollover briefly exposes an empty directory; treat every
+        # lookup failure as "nothing new yet" and let the poll retry.
+        try:
+            sess = os.path.join(base, sorted(os.listdir(base))[-1])
+            day = os.path.join(sess, sorted(os.listdir(sess))[-1])
+            return os.path.join(day, sorted(os.listdir(day), key=int)[-1])
+        except (OSError, IndexError, ValueError):
+            return None
 
-    path = newest()
-    handle = open(path, "rb")
-    handle.seek(0, 2)
+    path = None
+    handle = None
     buffer = b""
     deadline = time.time() + duration
     while time.time() < deadline:
+        if handle is None:
+            path = newest()
+            if path is None:
+                time.sleep(0.1)
+                continue
+            handle = open(path, "rb")
+            handle.seek(0, 2)
+            buffer = b""
         chunk = handle.read()
         if not chunk:
             latest = newest()
-            if latest != path:
+            if latest is not None and latest != path:
+                handle.close()
                 path = latest
                 handle = open(path, "rb")
+                buffer = b""
             time.sleep(0.005)
             continue
         buffer += chunk
@@ -74,6 +88,8 @@ def capture(base, duration):
 
 
 def quantiles(values):
+    if not values:
+        return "n=0 (no samples)"
     ordered = sorted(values)
 
     def q(p):
@@ -92,6 +108,9 @@ def load(path):
 def report(paths):
     runs = [load(p) for p in paths]
     for path, run in zip(paths, runs):
+        if not run:
+            print(f"{path}: no captured blocks — empty or mis-pointed capture")
+            continue
         ages = [(row["w"] - row["t"]) * 1000 for row in run.values()]
         negatives = sum(1 for a in ages if a < 0)
         print(f"{path}: age_ms {quantiles(ages)} negatives={negatives}")
