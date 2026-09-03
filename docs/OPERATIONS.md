@@ -37,8 +37,14 @@ Required public Quicknode endpoint configuration:
 
 Required peering configuration (peering processes only):
 
+- `PEERING_PROVIDER`: `quicknode` (default), `hydromancer`, or `comparison`
+  (both services from this one process, one two-source cohort per round).
 - `QUICKNODE_PEERING_ENDPOINT`, a bare `host:port` with no scheme or
-  credentials — the public peering service address.
+  credentials — the Quicknode peering service address. Required for
+  `quicknode` and `comparison`.
+- `HYDROMANCER_PEERING_ENDPOINT`, the same shape for the Hydromancer peering
+  service. Required for `hydromancer` and `comparison`; the observer's source
+  address must be admitted by that service or the subscription is refused.
 - `PEERING_REFERENCE_FEED`, a bare `host:port` serving the NDJSON block
   reference feed (deterministic chain data reproducible from any Hyperliquid
   node's replay output; see METHODOLOGY). A stalled feed surfaces as
@@ -72,11 +78,12 @@ Before a fleet rollout, prove `bbo`, `l2book`, `fills`, and the opt-in
 
 1. every process remains active and keeps its expected persistent connections
    (three for books, two for fills, one for mempool, and for peering one
-   subscription plus its reference-feed connection);
+   subscription per dialed service plus one reference-feed connection each);
 2. runtime clock health is valid;
 3. outbox files are acknowledged and removed without drops;
 4. Axiom contains exactly three provider rows per book window, two per fills
-   window, and one per mempool or peering window;
+   window, one per mempool window, and one per dialed service per peering
+   window (two in comparison mode);
 5. all rows agree on runner, run, window, interval outcome, and sample count;
 6. P50 <= P95 <= P99 and no negative/zero placeholder is synthesized;
 7. a deliberate credential failure is visible and recovers without data

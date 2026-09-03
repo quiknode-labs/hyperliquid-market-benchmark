@@ -6,11 +6,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use clap::ValueEnum;
 use tokio::sync::mpsc;
 
-pub const PROVIDERS: [Provider; 4] = [
+pub const PROVIDERS: [Provider; 5] = [
     Provider::FoundationWs,
     Provider::HydromancerWs,
     Provider::QuickNodeGrpc,
     Provider::QuickNodePeeringTcp,
+    Provider::HydromancerPeeringTcp,
 ];
 pub const BOOK_PROVIDERS: [Provider; 3] = [
     Provider::FoundationWs,
@@ -20,6 +21,54 @@ pub const BOOK_PROVIDERS: [Provider; 3] = [
 pub const FILLS_PROVIDERS: [Provider; 2] = [Provider::FoundationWs, Provider::QuickNodeGrpc];
 pub const MEMPOOL_PROVIDERS: [Provider; 1] = [Provider::QuickNodeGrpc];
 pub const PEERING_PROVIDERS: [Provider; 1] = [Provider::QuickNodePeeringTcp];
+pub const HYDROMANCER_PEERING_PROVIDERS: [Provider; 1] = [Provider::HydromancerPeeringTcp];
+pub const PEERING_COMPARISON_PROVIDERS: [Provider; 2] = [
+    Provider::QuickNodePeeringTcp,
+    Provider::HydromancerPeeringTcp,
+];
+
+/// Which peering service(s) one `peering` process dials. `Comparison` dials
+/// both from the same observer and forms one exact two-source cohort per
+/// consensus round, so the two services are scored over identical blocks with
+/// one clock, one reference feed, and one block-ready boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
+pub enum PeeringMode {
+    Quicknode,
+    Hydromancer,
+    Comparison,
+}
+
+impl PeeringMode {
+    pub const fn providers(self) -> &'static [Provider] {
+        match self {
+            Self::Quicknode => &PEERING_PROVIDERS,
+            Self::Hydromancer => &HYDROMANCER_PEERING_PROVIDERS,
+            Self::Comparison => &PEERING_COMPARISON_PROVIDERS,
+        }
+    }
+
+    pub const fn cohort(self) -> &'static str {
+        match self {
+            Self::Quicknode => "quicknode-peering-tcp",
+            Self::Hydromancer => "hydromancer-peering-tcp",
+            Self::Comparison => "quicknode-peering-tcp+hydromancer-peering-tcp",
+        }
+    }
+
+    /// Peering content is the consensus round itself, so every service agrees
+    /// on content by construction and no service has to act as the canonical
+    /// reference. The value is only used where a single provider is required.
+    pub const fn reference_provider(self) -> Provider {
+        match self {
+            Self::Quicknode | Self::Comparison => Provider::QuickNodePeeringTcp,
+            Self::Hydromancer => Provider::HydromancerPeeringTcp,
+        }
+    }
+
+    pub const fn has_provider_comparison(self) -> bool {
+        matches!(self, Self::Comparison)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, ValueEnum)]
 pub enum Dataset {
@@ -115,6 +164,7 @@ pub enum Provider {
     HydromancerWs,
     QuickNodeGrpc,
     QuickNodePeeringTcp,
+    HydromancerPeeringTcp,
 }
 
 impl Provider {
@@ -124,6 +174,7 @@ impl Provider {
             Self::HydromancerWs => 1,
             Self::QuickNodeGrpc => 2,
             Self::QuickNodePeeringTcp => 3,
+            Self::HydromancerPeeringTcp => 4,
         }
     }
 
@@ -133,6 +184,7 @@ impl Provider {
             Self::HydromancerWs => "hydromancer-ws",
             Self::QuickNodeGrpc => "quicknode-grpc",
             Self::QuickNodePeeringTcp => "quicknode-peering",
+            Self::HydromancerPeeringTcp => "hydromancer-peering",
         }
     }
 
@@ -140,7 +192,7 @@ impl Provider {
         match self {
             Self::FoundationWs | Self::HydromancerWs => "ws",
             Self::QuickNodeGrpc => "grpc",
-            Self::QuickNodePeeringTcp => "tcp",
+            Self::QuickNodePeeringTcp | Self::HydromancerPeeringTcp => "tcp",
         }
     }
 }

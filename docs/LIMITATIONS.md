@@ -45,8 +45,13 @@
   downtime.
 - Public runner IDs identify cloud, logical region, and physical metro, not an
   exact host, availability zone, IP address, or customer tenant.
-- Peering is a one-source Quicknode measurement; no public comparator exposes
-  the raw gossip block stream. It cannot support a fastest-provider share.
+- A peering comparison is only as fair as its admission: the observer must be
+  a provisioned customer of every service it dials, and the two services are
+  compared from one observer address, so a service that is farther from that
+  observer than the other carries that network distance in its numbers. The
+  published result states the observer and the distance to each service.
+- Peering in single-service mode has no fastest-provider share; only
+  comparison mode, where both services are dialed by one process, produces one.
 - The block producer timestamp is supplied by the block's proposer. Proposer
   clock error affects every peering sample; the collector cannot correct it.
 - Peering measures the provisioned service tier: the collector's observer

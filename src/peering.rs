@@ -80,6 +80,7 @@ struct TrackedRound {
 }
 
 struct Assembly {
+    provider: Provider,
     coin: String,
     rounds: HashMap<u64, TrackedRound>,
     /// first-record sig.r -> (arrival instant, arrival wall ms, seen at)
@@ -89,8 +90,9 @@ struct Assembly {
 }
 
 impl Assembly {
-    fn new(coin: String) -> Self {
+    fn new(provider: Provider, coin: String) -> Self {
         Self {
+            provider,
             coin,
             rounds: HashMap::new(),
             bundles: HashMap::new(),
@@ -191,7 +193,7 @@ impl Assembly {
             }
             tracked.reported_gap = true; // completed; never revisit
             ready.push(MarketEvent {
-                provider: Provider::QuickNodePeeringTcp,
+                provider: self.provider,
                 key: EventKey {
                     coin: coin.clone(),
                     event_ms: reference.time_ms,
@@ -215,6 +217,7 @@ impl Assembly {
 }
 
 pub async fn run_peering(
+    provider: Provider,
     endpoint: String,
     reference_endpoint: String,
     coin: String,
@@ -223,13 +226,13 @@ pub async fn run_peering(
     let mut backoff = ReconnectBackoff::default();
     loop {
         let started = Instant::now();
-        match run_peering_once(&endpoint, &reference_endpoint, &coin, &sender).await {
+        match run_peering_once(provider, &endpoint, &reference_endpoint, &coin, &sender).await {
             Ok(()) => warn!(%coin, "peering stream ended"),
             Err(error) => warn!(%coin, ?error, "peering stream disconnected"),
         }
         if !sender
             .send(ProbeEvent::Reconnect {
-                provider: Provider::QuickNodePeeringTcp,
+                provider,
                 coin: coin.clone(),
             })
             .await
@@ -241,6 +244,7 @@ pub async fn run_peering(
 }
 
 async fn run_peering_once(
+    provider: Provider,
     endpoint: &str,
     reference_endpoint: &str,
     coin: &str,
@@ -271,9 +275,9 @@ async fn run_peering_once(
         .write_all(&SUBSCRIBE_HELLO)
         .await
         .context("send peering subscribe hello")?;
-    let _connection = sender.connected(Provider::QuickNodePeeringTcp, coin);
+    let _connection = sender.connected(provider, coin);
 
-    let mut assembly = Assembly::new(coin.to_owned());
+    let mut assembly = Assembly::new(provider, coin.to_owned());
     let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
     let mut chunk = vec![0u8; 256 * 1024];
     let mut maintenance = tokio::time::interval(Duration::from_millis(500));
@@ -308,7 +312,7 @@ async fn run_peering_once(
         if expired > 0
             && !sender
                 .send(ProbeEvent::SequenceGap {
-                    provider: Provider::QuickNodePeeringTcp,
+                    provider,
                     coin: coin.to_owned(),
                     missing: expired,
                 })
@@ -647,7 +651,7 @@ mod tests {
 
     #[test]
     fn block_ready_boundary_is_the_last_required_arrival() {
-        let mut assembly = Assembly::new("BLOCKS".to_owned());
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
         let sig_a = [0x11; 32];
         let sig_b = [0x22; 32];
         assembly.track_reference(reference_line(
@@ -682,7 +686,7 @@ mod tests {
 
     #[test]
     fn incomplete_round_expires_into_exactly_one_gap() {
-        let mut assembly = Assembly::new("BLOCKS".to_owned());
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
         assembly.track_reference(reference_line(
             2_000_000,
             "2026-08-10T14:43:15.0",
@@ -703,7 +707,7 @@ mod tests {
 
     #[test]
     fn ordering_rounds_outside_the_reference_window_are_ignored() {
-        let mut assembly = Assembly::new("BLOCKS".to_owned());
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
         assembly.track_reference(reference_line(
             1_000_000,
             "2026-08-10T14:43:15.0",
@@ -717,7 +721,7 @@ mod tests {
                 .contains_key(&(1_000_000 + ROUND_WINDOW + 1))
         );
         // And with no reference anchor at all, nothing is tracked.
-        let mut cold = Assembly::new("BLOCKS".to_owned());
+        let mut cold = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
         cold.track_ordering(1_000_000, t0, 1);
         assert!(cold.rounds.is_empty());
     }
@@ -730,7 +734,7 @@ mod tests {
 
         let mut buf = lz4_frame(&ordering);
         buf.extend_from_slice(&lz4_frame(&bundle));
-        let mut assembly = Assembly::new("BLOCKS".to_owned());
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
         assembly.track_reference(reference_line(1_500_000, "2026-08-10T14:43:15.0", &[sig]));
         consume_frames(&mut buf, &mut assembly, Instant::now(), 42).unwrap();
         assert!(buf.is_empty(), "both frames fully consumed");
@@ -744,7 +748,7 @@ mod tests {
 
     #[test]
     fn oversize_frame_is_a_desync_error_and_partial_frames_wait() {
-        let mut assembly = Assembly::new("BLOCKS".to_owned());
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
         let mut oversize = (MAX_FRAME_BODY + 1).to_be_bytes().to_vec();
         oversize.push(0x01);
         assert!(consume_frames(&mut oversize, &mut assembly, Instant::now(), 0).is_err());

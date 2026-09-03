@@ -46,7 +46,10 @@ pub struct StreamConfig {
     pub hydromancer_token: String,
     pub quicknode_grpc: String,
     pub quicknode_token: String,
-    pub peering_endpoint: String,
+    /// One (provider, host:port) per peering service the peering dataset
+    /// dials; each gets its own subscriber task stamping that provider on its
+    /// rows. Ignored by every other dataset.
+    pub peering_endpoints: Vec<(Provider, String)>,
     pub peering_reference: String,
 }
 
@@ -87,17 +90,16 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
                 sender.clone(),
             )));
         }
-        if config
-            .dataset
-            .providers()
-            .contains(&Provider::QuickNodePeeringTcp)
-        {
-            tasks.push(tokio::spawn(crate::peering::run_peering(
-                config.peering_endpoint.clone(),
-                config.peering_reference.clone(),
-                coin,
-                sender.clone(),
-            )));
+        if config.dataset == Dataset::Peering {
+            for (provider, endpoint) in &config.peering_endpoints {
+                tasks.push(tokio::spawn(crate::peering::run_peering(
+                    *provider,
+                    endpoint.clone(),
+                    config.peering_reference.clone(),
+                    coin.clone(),
+                    sender.clone(),
+                )));
+            }
         }
     }
     tasks

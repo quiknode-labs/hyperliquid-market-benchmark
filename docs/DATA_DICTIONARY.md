@@ -56,15 +56,27 @@ consumer must not replace an omitted value with zero.
 ### Peering dataset notes
 
 - `dataset` is `peering`, `coin` is the pinned label `BLOCKS` (consensus
-  blocks, not a market), `provider` is `quicknode`, `protocol` is `tcp`, and
-  `source`/`cohort` are `quicknode-peering`/`quicknode-peering-tcp`.
+  blocks, not a market), and `protocol` is `tcp`. `provider`/`source` are
+  `quicknode`/`quicknode-peering` for the Quicknode service and
+  `hydromancer`/`hydromancer-peering` for the Hydromancer service.
+- `cohort` names the exact set of services one process dialed:
+  `quicknode-peering-tcp`, `hydromancer-peering-tcp`, or, in comparison mode,
+  `quicknode-peering-tcp+hydromancer-peering-tcp`.
 - `schema` is `hyperliquid-market-benchmark-v4` and `measurement_version` is
   `peering-block-ready-v1`.
 - `sequence_gaps` counts consensus rounds that failed to complete (ordering or
   referenced bundle content missing) within the cohort deadline — the stream
   completeness signal. `matched_count` counts complete block-ready samples.
-- One-source dataset: `outcome_count_scope` is `not-applicable` and every
+- Single-service modes: `outcome_count_scope` is `not-applicable` and every
   fastest/tie count is zero by construction.
+- Comparison mode: both rows share one two-source cohort per consensus round.
+  Peering content is the round itself, so no service acts as the canonical
+  reference: a round delivered by either service is real, a service that never
+  delivers it is counted in `missing_count`, and only rounds both services
+  delivered enter the latency distribution (equal `sample_count` on both rows).
+  Outcome counts follow the book datasets: `outcome_quicknode_*` and
+  `outcome_hydromancer_*` are per provider company, whichever transport that
+  process dialed.
 
 ## Rolling distribution
 

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use axiom::{AxiomClient, spawn_axiom_worker};
 use benchmark::{Benchmark, BenchmarkConfig};
 use clap::Parser;
-use model::{Dataset, ProbeEvent, ProbeSender, RuntimeSignals};
+use model::{Dataset, PeeringMode, ProbeEvent, ProbeSender, Provider, RuntimeSignals};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -58,9 +58,25 @@ struct Args {
     #[arg(long, env = "QUICKNODE_HYPERLIQUID_GRPC_URL")]
     quicknode_grpc: Option<String>,
 
-    /// Quicknode peering endpoint (host:port). Anonymous public tier; no credentials exist.
-    #[arg(long, env = "QUICKNODE_PEERING_ENDPOINT")]
-    peering_endpoint: Option<String>,
+    /// Quicknode peering endpoint (host:port). Required when --peering-provider
+    /// is `quicknode` or `comparison`.
+    #[arg(
+        long = "quicknode-peering-endpoint",
+        alias = "peering-endpoint",
+        env = "QUICKNODE_PEERING_ENDPOINT"
+    )]
+    quicknode_peering_endpoint: Option<String>,
+
+    /// Hydromancer peering endpoint (host:port). Required when
+    /// --peering-provider is `hydromancer` or `comparison`.
+    #[arg(long, env = "HYDROMANCER_PEERING_ENDPOINT")]
+    hydromancer_peering_endpoint: Option<String>,
+
+    /// Which peering service(s) the peering dataset dials. `comparison` dials
+    /// both from this one process and scores them over identical rounds; each
+    /// row is stamped with its own provider and source. See docs/PEERING_TEST.md.
+    #[arg(long, value_enum, env = "PEERING_PROVIDER", default_value_t = PeeringMode::Quicknode)]
+    peering_provider: PeeringMode,
 
     /// Peering block reference feed (host:port, NDJSON). Deterministic chain data
     /// reproducible from any Hyperliquid node's replay output; see METHODOLOGY.
@@ -188,22 +204,20 @@ async fn main() -> Result<()> {
     } else {
         String::new()
     };
-    let (peering_endpoint, peering_reference) = if args
-        .dataset
-        .providers()
-        .contains(&model::Provider::QuickNodePeeringTcp)
-    {
-        let endpoint = args.peering_endpoint.clone().context(
-            "--peering-endpoint (QUICKNODE_PEERING_ENDPOINT) is required for the peering dataset",
+    let peering_mode = args.peering_provider;
+    let (peering_endpoints, peering_reference) = if args.dataset == Dataset::Peering {
+        let endpoints = peering_endpoints(
+            peering_mode,
+            args.quicknode_peering_endpoint.as_deref(),
+            args.hydromancer_peering_endpoint.as_deref(),
         )?;
-        peering::validate_peering_endpoint(&endpoint, "peering endpoint")?;
         let reference = args.peering_reference.clone().context(
             "--peering-reference (PEERING_REFERENCE_FEED) is required for the peering dataset",
         )?;
         peering::validate_peering_endpoint(&reference, "peering reference feed")?;
-        (endpoint, reference)
+        (endpoints, reference)
     } else {
-        (String::new(), String::new())
+        (Vec::new(), String::new())
     };
     let axiom_token = required_secret("AXIOM_API_TOKEN")?;
     let axiom_org_id = std::env::var("AXIOM_ORG_ID")
@@ -256,6 +270,7 @@ async fn main() -> Result<()> {
     config.cohort_timeout = COHORT_TIMEOUT;
     config.stale_after = STALE_AFTER;
     config.artifact_sha256 = artifact_sha256;
+    config.peering_mode = peering_mode;
     let mut benchmark = Benchmark::new(config, now, wall_now);
 
     let signals = Arc::new(RuntimeSignals::new(&coins));
@@ -270,7 +285,7 @@ async fn main() -> Result<()> {
             hydromancer_token,
             quicknode_grpc,
             quicknode_token,
-            peering_endpoint,
+            peering_endpoints,
             peering_reference,
         },
         sender,
@@ -279,6 +294,7 @@ async fn main() -> Result<()> {
     info!(
         schema = args.dataset.schema(),
         dataset = args.dataset.label(),
+        peering_mode = ?peering_mode,
         coins = %coins.join(","),
         %cloud,
         %region,
@@ -398,6 +414,45 @@ async fn shutdown_signal() -> Result<()> {
         .context("install Ctrl-C handler")
 }
 
+/// Resolve one validated endpoint per peering service the mode dials. Two
+/// services may never share an endpoint: that would score one wire twice under
+/// two names.
+fn peering_endpoints(
+    mode: PeeringMode,
+    quicknode: Option<&str>,
+    hydromancer: Option<&str>,
+) -> Result<Vec<(Provider, String)>> {
+    let mut endpoints = Vec::with_capacity(mode.providers().len());
+    for &provider in mode.providers() {
+        let (value, flag) = match provider {
+            Provider::QuickNodePeeringTcp => (
+                quicknode,
+                "--quicknode-peering-endpoint (QUICKNODE_PEERING_ENDPOINT)",
+            ),
+            Provider::HydromancerPeeringTcp => (
+                hydromancer,
+                "--hydromancer-peering-endpoint (HYDROMANCER_PEERING_ENDPOINT)",
+            ),
+            other => anyhow::bail!("{} is not a peering provider", other.name()),
+        };
+        let endpoint = value.with_context(|| {
+            format!(
+                "{flag} is required for peering provider {}",
+                provider.name()
+            )
+        })?;
+        peering::validate_peering_endpoint(endpoint, "peering endpoint")?;
+        endpoints.push((provider, endpoint.to_owned()));
+    }
+    if endpoints.len() > 1 && endpoints[0].1 == endpoints[1].1 {
+        anyhow::bail!(
+            "peering comparison needs two distinct endpoints, got {} twice",
+            endpoints[0].1
+        );
+    }
+    Ok(endpoints)
+}
+
 fn next_publish_deadline() -> tokio::time::Instant {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -499,23 +554,36 @@ fn validate_public_identity(runner: &str, cloud: &str, region: &str, metro: &str
     if !PUBLIC_CLOUDS.contains(&cloud) {
         anyhow::bail!("unsupported public cloud '{cloud}'");
     }
-    let expected = if region == "us-west" {
+    let prefix = if region == "us-west" {
         let fleet_metro = if cloud == "gcp" { "lax" } else { "sjc" };
         if metro != fleet_metro {
             anyhow::bail!(
                 "public {cloud} us-west runners must use the current fleet metro '{fleet_metro}'"
             );
         }
-        format!("{cloud}-usw-{metro}-01")
+        format!("{cloud}-usw-{metro}")
     } else {
         if metro != region {
             anyhow::bail!("public runner metro '{metro}' must match non-us-west region '{region}'");
         }
-        format!("{cloud}-{region}-01")
+        format!("{cloud}-{region}")
     };
-    if runner != expected {
+    // One public observer per cloud/region/metro is the norm; a second machine
+    // in the same location (for example a peering observer that must be
+    // admitted by every compared service) takes the next ordinal. The ID still
+    // carries nothing but public location and ordinal.
+    let ordinal = runner
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .filter(|ordinal| {
+            ordinal.len() == 2
+                && ordinal.starts_with('0')
+                && ordinal.as_bytes()[1].is_ascii_digit()
+                && ordinal != &"00"
+        });
+    if ordinal.is_none() {
         anyhow::bail!(
-            "public runner ID must be '{expected}' for cloud={cloud}, region={region}, metro={metro}; private or inventory hostnames are forbidden"
+            "public runner ID must be '{prefix}-01' through '{prefix}-09' for cloud={cloud}, region={region}, metro={metro}; private or inventory hostnames are forbidden"
         );
     }
     Ok(())
@@ -542,6 +610,45 @@ mod tests {
         assert_eq!(parse_coins("btc, ETH,btc").unwrap(), vec!["BTC", "ETH"]);
         assert!(parse_coins(" , ").is_err());
         assert!(parse_coins("BTC/USD").is_err());
+    }
+
+    #[test]
+    fn peering_endpoints_require_one_distinct_endpoint_per_dialed_service() {
+        let quicknode = Some("relay.example.test:4001");
+        let hydromancer = Some("sentry.example.test:4001");
+
+        let single = peering_endpoints(PeeringMode::Quicknode, quicknode, None).unwrap();
+        assert_eq!(
+            single,
+            vec![(
+                Provider::QuickNodePeeringTcp,
+                "relay.example.test:4001".to_owned()
+            )]
+        );
+        assert!(peering_endpoints(PeeringMode::Hydromancer, quicknode, None).is_err());
+        assert!(peering_endpoints(PeeringMode::Comparison, quicknode, None).is_err());
+
+        let both = peering_endpoints(PeeringMode::Comparison, quicknode, hydromancer).unwrap();
+        assert_eq!(
+            both.iter()
+                .map(|(provider, _)| *provider)
+                .collect::<Vec<_>>(),
+            vec![
+                Provider::QuickNodePeeringTcp,
+                Provider::HydromancerPeeringTcp
+            ]
+        );
+        // One wire may never be scored twice under two names.
+        assert!(peering_endpoints(PeeringMode::Comparison, quicknode, quicknode).is_err());
+        // Endpoint validation still applies to every service.
+        assert!(
+            peering_endpoints(
+                PeeringMode::Comparison,
+                quicknode,
+                Some("tcp://x.test:4001")
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -586,6 +693,14 @@ mod tests {
         assert!(validate_public_identity("aws-usw-lax-01", "aws", "us-west", "lax").is_err());
         assert!(validate_public_identity("gcp-usw-sjc-01", "gcp", "us-west", "sjc").is_err());
         assert!(validate_public_identity("oracle-usw-lax-01", "oracle", "us-west", "lax").is_err());
+        // A second public observer in the same location takes the next ordinal;
+        // anything that is not a two-digit ordinal 01-09 is still refused.
+        assert!(validate_public_identity("oracle-nrt-02", "oracle", "nrt", "nrt").is_ok());
+        assert!(validate_public_identity("gcp-usw-lax-03", "gcp", "us-west", "lax").is_ok());
+        assert!(validate_public_identity("oracle-nrt-00", "oracle", "nrt", "nrt").is_err());
+        assert!(validate_public_identity("oracle-nrt-10", "oracle", "nrt", "nrt").is_err());
+        assert!(validate_public_identity("oracle-nrt-02-a00", "oracle", "nrt", "nrt").is_err());
+        assert!(validate_public_identity("oracle-nrt-2", "oracle", "nrt", "nrt").is_err());
     }
 
     #[test]
