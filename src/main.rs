@@ -554,23 +554,36 @@ fn validate_public_identity(runner: &str, cloud: &str, region: &str, metro: &str
     if !PUBLIC_CLOUDS.contains(&cloud) {
         anyhow::bail!("unsupported public cloud '{cloud}'");
     }
-    let expected = if region == "us-west" {
+    let prefix = if region == "us-west" {
         let fleet_metro = if cloud == "gcp" { "lax" } else { "sjc" };
         if metro != fleet_metro {
             anyhow::bail!(
                 "public {cloud} us-west runners must use the current fleet metro '{fleet_metro}'"
             );
         }
-        format!("{cloud}-usw-{metro}-01")
+        format!("{cloud}-usw-{metro}")
     } else {
         if metro != region {
             anyhow::bail!("public runner metro '{metro}' must match non-us-west region '{region}'");
         }
-        format!("{cloud}-{region}-01")
+        format!("{cloud}-{region}")
     };
-    if runner != expected {
+    // One public observer per cloud/region/metro is the norm; a second machine
+    // in the same location (for example a peering observer that must be
+    // admitted by every compared service) takes the next ordinal. The ID still
+    // carries nothing but public location and ordinal.
+    let ordinal = runner
+        .strip_prefix(&prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .filter(|ordinal| {
+            ordinal.len() == 2
+                && ordinal.starts_with('0')
+                && ordinal.as_bytes()[1].is_ascii_digit()
+                && ordinal != &"00"
+        });
+    if ordinal.is_none() {
         anyhow::bail!(
-            "public runner ID must be '{expected}' for cloud={cloud}, region={region}, metro={metro}; private or inventory hostnames are forbidden"
+            "public runner ID must be '{prefix}-01' through '{prefix}-09' for cloud={cloud}, region={region}, metro={metro}; private or inventory hostnames are forbidden"
         );
     }
     Ok(())
@@ -680,6 +693,14 @@ mod tests {
         assert!(validate_public_identity("aws-usw-lax-01", "aws", "us-west", "lax").is_err());
         assert!(validate_public_identity("gcp-usw-sjc-01", "gcp", "us-west", "sjc").is_err());
         assert!(validate_public_identity("oracle-usw-lax-01", "oracle", "us-west", "lax").is_err());
+        // A second public observer in the same location takes the next ordinal;
+        // anything that is not a two-digit ordinal 01-09 is still refused.
+        assert!(validate_public_identity("oracle-nrt-02", "oracle", "nrt", "nrt").is_ok());
+        assert!(validate_public_identity("gcp-usw-lax-03", "gcp", "us-west", "lax").is_ok());
+        assert!(validate_public_identity("oracle-nrt-00", "oracle", "nrt", "nrt").is_err());
+        assert!(validate_public_identity("oracle-nrt-10", "oracle", "nrt", "nrt").is_err());
+        assert!(validate_public_identity("oracle-nrt-02-a00", "oracle", "nrt", "nrt").is_err());
+        assert!(validate_public_identity("oracle-nrt-2", "oracle", "nrt", "nrt").is_err());
     }
 
     #[test]
