@@ -21,13 +21,18 @@ subscribes to `MEMPOOL_TXS` through `StreamData` with the production
 same pre-consensus bundle and first-seen timestamp, so mempool is an absolute
 delivery measurement rather than a provider race.
 
-The `peering` dataset measures the Quicknode peering service: absolute
-delivery latency and completeness of Hyperliquid consensus blocks over a plain
-TCP gossip subscription, connected as a provisioned peering customer
-receiving the full-speed stream. It is a one-source absolute measurement like
-mempool; block
-producer timestamps and bundle identities come from a reference feed of
-deterministic chain data reproducible from any node's replay output.
+The `peering` dataset measures peering services: absolute delivery latency and
+completeness of Hyperliquid consensus blocks over a plain TCP gossip
+subscription, connected as a provisioned peering customer receiving the
+full-speed stream. One process can dial the Quicknode service alone
+(`--peering-provider quicknode`), the Hydromancer service alone
+(`hydromancer`), or both at once (`comparison`). In comparison mode the two
+subscriptions share one observer, one clock, one reference feed, and one
+block-ready boundary, and every consensus round forms an exact two-source
+cohort, so the services are scored over identical blocks with the same
+fastest-provider share as the book datasets. Block producer timestamps and
+bundle identities come from a reference feed of deterministic chain data
+reproducible from any node's replay output.
 
 The benchmark reports absolute delivery latency, not a race delta, synthetic
 score, order-to-fill latency, or matching-engine execution time:

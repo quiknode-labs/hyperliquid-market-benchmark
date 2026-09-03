@@ -76,6 +76,31 @@ The collector applies its own integrity gates: rounds with future producer
 timestamps, gaps, or incomplete bundle sets are counted and excluded, never
 guessed (see [METHODOLOGY.md](METHODOLOGY.md)).
 
+### Tier A comparison — two services, one observer, identical rounds
+
+Admission is the whole game: a peering service serves registered node
+addresses only, so the collector's subscribe wire is accepted from an
+admitted address and refused from any other. Once one observer is admitted by
+two services, the strongest form of Tier A is to dial both from the same
+process:
+
+```bash
+PEERING_PROVIDER=comparison \
+QUICKNODE_PEERING_ENDPOINT=<quicknode host:port> \
+HYDROMANCER_PEERING_ENDPOINT=<hydromancer host:port> \
+PEERING_REFERENCE_FEED=<your node host:9464> \
+hyperliquid-market-benchmark --dataset peering
+```
+
+Each consensus round becomes one two-source cohort: the same block, the same
+clock, the same reference feed, the same block-ready boundary. Only rounds both
+services delivered enter the latency distributions; a round one service never
+delivered is a miss for that service, not a dropped round, and the
+fastest-provider share is the strictly-first service per round. This removes
+every box asymmetry that Protocol 2 below has to argue away, at the cost of
+requiring dual admission. Disclose the observer's network distance to each
+service endpoint (RTT); it is part of the result.
+
 ## Tier B — node-applied, or "anyone can referee"
 
 Tier B needs nothing but a stock node and one standard-library script. It

@@ -103,15 +103,25 @@ distinct bundles first seen within the same millisecond remain distinct samples.
 
 ## Peering block readiness
 
-The `peering` dataset measures one path: a plain TCP subscriber connected to a
-Quicknode peering service endpoint, consuming Hyperliquid's native gossip wire
-stream exactly as any peered node would. The collector connects as a
-provisioned peering customer: its observer source addresses are registered
+The `peering` dataset measures plain TCP subscribers connected to peering
+service endpoints, consuming Hyperliquid's native gossip wire stream exactly
+as any peered node would. The collector connects as a provisioned peering
+customer of each service it dials: its observer source address is registered
 with the service and it receives the full-speed stream, so every published
 value is the delivery latency a peering customer experiences — no synthetic
-allowances in either direction. No other public source exposes the
-raw gossip block stream with the producer timestamp, so peering, like mempool,
-is an absolute delivery measurement with no fastest-provider share.
+allowances in either direction.
+
+One process dials one service (an absolute measurement with no
+fastest-provider share, like mempool) or, in comparison mode, two services at
+once. In comparison mode both subscriptions run in the same process on the
+same observer, share the same clock and the same reference feed, and stop at
+the same block-ready boundary. Every consensus round is one exact two-source
+cohort: only rounds both services delivered within the cohort deadline enter
+the latency distributions, a round one service never delivered is counted
+against that service as missing, and the fastest-provider share is the
+strictly-first service per round, exactly as for the book datasets. Because
+peering content is the round number itself, neither service is treated as the
+canonical reference; the cohort is symmetric.
 
 A block is **ready** when its ordering record has been received and parsed
 (consensus round plus the list of referenced transaction bundles) and every

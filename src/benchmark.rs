@@ -7,8 +7,8 @@ use serde::Serialize;
 use crate::axiom::IngestHealthSnapshot;
 use crate::clock::ClockHealthSnapshot;
 use crate::model::{
-    BaseKey, ContentKey, Dataset, EventKey, MarketEvent, PROVIDERS, ProbeEvent, Provider,
-    RuntimeSignals,
+    BaseKey, ContentKey, Dataset, EventKey, MarketEvent, PROVIDERS, PeeringMode, ProbeEvent,
+    Provider, RuntimeSignals,
 };
 
 #[cfg(test)]
@@ -66,6 +66,9 @@ pub struct BenchmarkConfig {
     pub max_pending: usize,
     pub max_settled: usize,
     pub max_rolling_cohorts: usize,
+    /// Which peering service(s) the peering dataset dials and stamps. Ignored
+    /// by every other dataset, which keeps its static provider set.
+    pub peering_mode: PeeringMode,
 }
 
 impl BenchmarkConfig {
@@ -96,7 +99,48 @@ impl BenchmarkConfig {
             max_pending,
             max_settled,
             max_rolling_cohorts,
+            peering_mode: PeeringMode::Quicknode,
         }
+    }
+}
+
+impl BenchmarkConfig {
+    pub fn providers(&self) -> &'static [Provider] {
+        match self.dataset {
+            Dataset::Peering => self.peering_mode.providers(),
+            _ => self.dataset.providers(),
+        }
+    }
+
+    pub fn cohort(&self) -> &'static str {
+        match self.dataset {
+            Dataset::Peering => self.peering_mode.cohort(),
+            _ => self.dataset.cohort(),
+        }
+    }
+
+    pub fn reference_provider(&self) -> Provider {
+        match self.dataset {
+            Dataset::Peering => self.peering_mode.reference_provider(),
+            _ => self.dataset.reference_provider(),
+        }
+    }
+
+    pub fn has_provider_comparison(&self) -> bool {
+        match self.dataset {
+            Dataset::Peering => self.peering_mode.has_provider_comparison(),
+            _ => self.dataset.has_provider_comparison(),
+        }
+    }
+
+    /// Books and trades need a reference provider to decide which content is
+    /// canonical when providers disagree. Peering content is the consensus
+    /// round number, which every service agrees on by construction, so a round
+    /// delivered by any dialed service is canonical and a service that never
+    /// delivers it is scored as missing rather than silently dropping the
+    /// round. This is what keeps a two-service peering cohort symmetric.
+    fn canonical_by_any_arrival(&self) -> bool {
+        self.dataset == Dataset::Peering
     }
 }
 
@@ -479,8 +523,8 @@ impl Benchmark {
         let clock_checked_at =
             format_time(UNIX_EPOCH + Duration::from_millis(clock.checked_at_wall_ms));
         let mut outcome_counts = HashMap::with_capacity(self.config.coins.len());
-        let providers = self.config.dataset.providers();
-        let has_provider_comparison = self.config.dataset.has_provider_comparison();
+        let providers = self.config.providers();
+        let has_provider_comparison = self.config.has_provider_comparison();
         for coin in &self.config.coins {
             let window = self.windows.get(coin).expect("registered coin");
             outcome_counts.insert(
@@ -621,7 +665,7 @@ impl Benchmark {
                     },
                     run_id: self.config.run_id.clone(),
                     runner_uptime_seconds: now.saturating_duration_since(self.started_at).as_secs(),
-                    cohort: self.config.dataset.cohort(),
+                    cohort: self.config.cohort(),
                     cohort_complete,
                     sample_count,
                     min_ready_samples: MIN_READY_SAMPLES as u64,
@@ -642,16 +686,24 @@ impl Benchmark {
                     outcome_complete_cohort_count: outcomes.complete,
                     outcome_foundation_strict_fastest_count: outcomes.strict_fastest
                         [Provider::FoundationWs.index()],
-                    outcome_hydromancer_strict_fastest_count: outcomes.strict_fastest
-                        [Provider::HydromancerWs.index()],
-                    outcome_quicknode_strict_fastest_count: outcomes.strict_fastest
-                        [Provider::QuickNodeGrpc.index()],
+                    outcome_hydromancer_strict_fastest_count: provider_family_total(
+                        &outcomes.strict_fastest,
+                        HYDROMANCER_FAMILY,
+                    ),
+                    outcome_quicknode_strict_fastest_count: provider_family_total(
+                        &outcomes.strict_fastest,
+                        QUICKNODE_FAMILY,
+                    ),
                     outcome_foundation_tied_fastest_count: outcomes.tied_fastest
                         [Provider::FoundationWs.index()],
-                    outcome_hydromancer_tied_fastest_count: outcomes.tied_fastest
-                        [Provider::HydromancerWs.index()],
-                    outcome_quicknode_tied_fastest_count: outcomes.tied_fastest
-                        [Provider::QuickNodeGrpc.index()],
+                    outcome_hydromancer_tied_fastest_count: provider_family_total(
+                        &outcomes.tied_fastest,
+                        HYDROMANCER_FAMILY,
+                    ),
+                    outcome_quicknode_tied_fastest_count: provider_family_total(
+                        &outcomes.tied_fastest,
+                        QUICKNODE_FAMILY,
+                    ),
                     outcome_tie_count: outcomes.ties,
                     p50_ms: summary.map(|value| value.p50),
                     p95_ms: summary.map(|value| value.p95),
@@ -763,7 +815,7 @@ impl Benchmark {
 
     fn record_market(&mut self, event: MarketEvent) {
         let provider = event.provider;
-        if !self.config.dataset.providers().contains(&provider) {
+        if !self.config.providers().contains(&provider) {
             return;
         }
         let coin = event.key.coin.clone();
@@ -820,7 +872,7 @@ impl Benchmark {
             self.settle(oldest, event.received, true);
         }
 
-        let settle_immediately = self.config.dataset.providers().len() == 1;
+        let settle_immediately = self.config.providers().len() == 1;
         let cohort = self
             .pending
             .entry(base.clone())
@@ -862,7 +914,7 @@ impl Benchmark {
             window.last_integrity_loss = Some(now);
         }
         for candidate in pending.candidates.values_mut() {
-            for &provider in self.config.dataset.providers() {
+            for &provider in self.config.providers() {
                 let arrived_after_deadline = candidate.arrivals[provider.index()]
                     .as_ref()
                     .is_some_and(|arrival| {
@@ -877,11 +929,21 @@ impl Benchmark {
                 }
             }
         }
-        let reference_provider = self.config.dataset.reference_provider();
+        let reference_provider = self.config.reference_provider();
+        let canonical_by_any_arrival = self.config.canonical_by_any_arrival();
+        let providers = self.config.providers();
         let reference_content = pending
             .candidates
             .iter()
-            .filter(|(_, candidate)| candidate.arrivals[reference_provider.index()].is_some())
+            .filter(|(_, candidate)| {
+                if canonical_by_any_arrival {
+                    providers
+                        .iter()
+                        .any(|provider| candidate.arrivals[provider.index()].is_some())
+                } else {
+                    candidate.arrivals[reference_provider.index()].is_some()
+                }
+            })
             .map(|(content, _)| content.clone())
             .collect::<HashSet<_>>();
         let mut noncanonical_seen = [false; PROVIDERS.len()];
@@ -889,7 +951,7 @@ impl Benchmark {
             if reference_content.contains(content) {
                 continue;
             }
-            for &provider in self.config.dataset.providers() {
+            for &provider in providers {
                 if candidate.arrivals[provider.index()].is_some() {
                     noncanonical_seen[provider.index()] = true;
                     self.counters_mut(provider, &key.coin).orphaned += 1;
@@ -920,10 +982,12 @@ impl Benchmark {
         now: Instant,
         noncanonical_seen: [bool; PROVIDERS.len()],
     ) {
+        let providers = self.config.providers();
         debug_assert!(
-            candidate.arrivals[self.config.dataset.reference_provider().index()].is_some()
+            providers
+                .iter()
+                .any(|provider| candidate.arrivals[provider.index()].is_some())
         );
-        let providers = self.config.dataset.providers();
         let complete = providers
             .iter()
             .all(|provider| candidate.arrivals[provider.index()].is_some());
@@ -1103,6 +1167,17 @@ fn distribution(mut values: Vec<u64>) -> Option<Distribution> {
     })
 }
 
+/// The outcome columns are per provider *company*, not per transport: a
+/// process dials at most one Quicknode path and one Hydromancer path, so the
+/// family total is always exactly one provider's count.
+const QUICKNODE_FAMILY: [Provider; 2] = [Provider::QuickNodeGrpc, Provider::QuickNodePeeringTcp];
+const HYDROMANCER_FAMILY: [Provider; 2] =
+    [Provider::HydromancerWs, Provider::HydromancerPeeringTcp];
+
+fn provider_family_total(counts: &[u64; PROVIDERS.len()], family: [Provider; 2]) -> u64 {
+    family.iter().map(|provider| counts[provider.index()]).sum()
+}
+
 fn unreported_outcomes(window: &CoinWindow, now: Instant, providers: &[Provider]) -> OutcomeCounts {
     let mut counts = OutcomeCounts::default();
     for cohort in window
@@ -1171,6 +1246,7 @@ fn public_provider(provider: Provider) -> &'static str {
         Provider::HydromancerWs => "hydromancer",
         Provider::QuickNodeGrpc => "quicknode",
         Provider::QuickNodePeeringTcp => "quicknode",
+        Provider::HydromancerPeeringTcp => "hydromancer",
     }
 }
 
@@ -1180,6 +1256,7 @@ fn public_source(provider: Provider) -> &'static str {
         Provider::HydromancerWs => "hydromancer-ws",
         Provider::QuickNodeGrpc => "quicknode-grpc",
         Provider::QuickNodePeeringTcp => "quicknode-peering",
+        Provider::HydromancerPeeringTcp => "hydromancer-peering",
     }
 }
 
@@ -1287,8 +1364,18 @@ mod tests {
     }
 
     fn peering(event_ms: u64, wall_ms: u64, now: Instant, round: u64) -> ProbeEvent {
+        peering_from(Provider::QuickNodePeeringTcp, event_ms, wall_ms, now, round)
+    }
+
+    fn peering_from(
+        provider: Provider,
+        event_ms: u64,
+        wall_ms: u64,
+        now: Instant,
+        round: u64,
+    ) -> ProbeEvent {
         ProbeEvent::Market(MarketEvent {
-            provider: Provider::QuickNodePeeringTcp,
+            provider,
             key: EventKey {
                 coin: "BLOCKS".to_owned(),
                 event_ms,
@@ -1513,7 +1600,7 @@ mod tests {
 
             let ring = &benchmark.windows["BTC"].cohorts;
             assert_eq!(ring.len(), 1);
-            assert_eq!(ring[0].latency_ms, [200, 300, 100, 0]);
+            assert_eq!(ring[0].latency_ms, [200, 300, 100, 0, 0]);
             for provider in BOOK_PROVIDERS {
                 assert_eq!(benchmark.counters["BTC"][provider.index()].matched, 1);
             }
@@ -1555,7 +1642,7 @@ mod tests {
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BTC"].cohorts[0].latency_ms,
-            [200, 0, 100, 0]
+            [200, 0, 100, 0, 0]
         );
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| {
@@ -1601,7 +1688,7 @@ mod tests {
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BTC"].cohorts[0].latency_ms,
-            [0, 0, 125, 0]
+            [0, 0, 125, 0, 0]
         );
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1671,7 +1758,7 @@ mod tests {
         assert_eq!(benchmark.windows["BLOCKS"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BLOCKS"].cohorts[0].latency_ms,
-            [0, 0, 0, 150]
+            [0, 0, 0, 150, 0]
         );
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1696,6 +1783,104 @@ mod tests {
         // no-raw-payload posture: no hex-encoded signature or hash value is serialized.
         let serialized = serde_json::to_string(event).unwrap();
         assert!(!serialized.contains("0x"));
+    }
+
+    #[test]
+    fn peering_comparison_scores_both_services_over_identical_rounds_symmetrically() {
+        let now = Instant::now();
+        let coins = vec!["BLOCKS".to_owned()];
+        let mut config = BenchmarkConfig::production(
+            Dataset::Peering,
+            coins.clone(),
+            "oracle".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "oracle-nrt-02".to_owned(),
+            "peering-comparison-run".to_owned(),
+        );
+        config.peering_mode = PeeringMode::Comparison;
+        config.cohort_timeout = Duration::from_secs(1);
+        let mut benchmark = Benchmark::new(config, now, UNIX_EPOCH);
+        let signals = RuntimeSignals::new(&coins);
+        for provider in crate::model::PEERING_COMPARISON_PROVIDERS {
+            signals.set_test_state(provider, "BLOCKS", true, 29_999, 0);
+        }
+
+        // Round 1: both services deliver the same block; Quicknode is first.
+        benchmark.record(peering_from(
+            Provider::QuickNodePeeringTcp,
+            1_000,
+            1_150,
+            now,
+            1,
+        ));
+        benchmark.record(peering_from(
+            Provider::HydromancerPeeringTcp,
+            1_000,
+            1_170,
+            now + Duration::from_millis(20),
+            1,
+        ));
+        // Round 2: only Hydromancer delivers before the cohort deadline. With no
+        // canonical reference service, this is a Quicknode miss on a real round,
+        // not a dropped round and not a Hydromancer orphan.
+        benchmark.record(peering_from(
+            Provider::HydromancerPeeringTcp,
+            2_000,
+            2_160,
+            now + Duration::from_millis(100),
+            2,
+        ));
+        benchmark.tick(now + Duration::from_secs(3));
+
+        let events = benchmark.window_events(
+            now + Duration::from_secs(4),
+            UNIX_EPOCH + Duration::from_millis(30_000),
+            &signals,
+            IngestHealthSnapshot::default(),
+            healthy_clock(30_000),
+        );
+        assert_eq!(events.len(), 2);
+        let quicknode = events
+            .iter()
+            .find(|event| event.source == "quicknode-peering")
+            .expect("quicknode peering row");
+        let hydromancer = events
+            .iter()
+            .find(|event| event.source == "hydromancer-peering")
+            .expect("hydromancer peering row");
+
+        for event in [quicknode, hydromancer] {
+            assert_eq!(event.protocol, "tcp");
+            assert_eq!(event.dataset, "peering");
+            assert_eq!(event.schema, "hyperliquid-market-benchmark-v4");
+            assert_eq!(
+                event.cohort,
+                "quicknode-peering-tcp+hydromancer-peering-tcp"
+            );
+            // Only the complete round enters the latency distribution, so both
+            // rows carry the same sample count over the same block.
+            assert_eq!(event.sample_count, 1);
+            assert_eq!(
+                event.outcome_count_scope,
+                "non-overlapping-publication-interval"
+            );
+            assert_eq!(event.outcome_complete_cohort_count, 1);
+            assert_eq!(event.outcome_quicknode_strict_fastest_count, 1);
+            assert_eq!(event.outcome_hydromancer_strict_fastest_count, 0);
+            assert_eq!(event.outcome_tie_count, 0);
+        }
+        assert_eq!(quicknode.provider, "quicknode");
+        assert_eq!(hydromancer.provider, "hydromancer");
+        assert_eq!(quicknode.p50_ms, Some(150.0));
+        assert_eq!(hydromancer.p50_ms, Some(170.0));
+
+        assert_eq!(quicknode.matched_count, 1);
+        assert_eq!(quicknode.missing_count, 1);
+        assert_eq!(quicknode.mismatch_count, 0);
+        assert_eq!(hydromancer.matched_count, 2);
+        assert_eq!(hydromancer.missing_count, 0);
+        assert_eq!(hydromancer.orphaned_count, 0);
     }
 
     #[test]
@@ -1841,7 +2026,7 @@ mod tests {
         for benchmark in [&late_then_early, &early_then_late] {
             let window = &benchmark.windows["BTC"];
             assert_eq!(window.cohorts.len(), 1);
-            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100, 0]);
+            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100, 0, 0]);
             assert_eq!(window.complete_cohorts, 1);
             assert_eq!(window.state_evictions, 0);
             assert_eq!(window.rolling_evictions, 0);
