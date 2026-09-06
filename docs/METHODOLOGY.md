@@ -62,7 +62,7 @@ canonical trade. This measures public trade-feed delivery. It does not measure
 customer order submission, acknowledgement, order-to-fill, or exchange
 matching-engine execution latency.
 
-## The Quicknode VPC source (fills)
+## The Quicknode VPC source (fills and peering)
 
 A Quicknode VPC box runs a Hyperliquid node fed by a co-located Quicknode sentry, and the
 customer's own client runs on that box. Its fills are measured the only honest way a
@@ -85,6 +85,26 @@ public like every other runner (`teraswitch-nrt-01`, cloud `teraswitch`), and th
 `quicknode-vpc` provider can only be stamped by a collector on such a box, so it never
 appears from a network observer. Outcome columns for it are `outcome_quicknode_vpc_*`; it is
 not folded into the Quicknode family because both Quicknode paths are present in one cohort.
+
+**Peering.** On the same box the peering collector adds the sentry itself as the VPC leg
+(`--vpc-decoded-socket <host:port>`). It subscribes to the sentry's decoded stream — the
+customer-facing socket that writes one JSON line per consensus round the moment the round's
+ordering frame arrives, with every referenced bundle decoded — and stamps each round when the
+complete `block` line has been fully read from that socket. That boundary is later than
+block-ready on the wire by exactly the sentry's decode and serialisation and the socket hop,
+which is the cost the product pays to hand a client decoded actions instead of frames; scoring
+both in one per-round cohort is what makes that cost visible. Producer timestamps still come from
+the reference feed, and the line is admitted only when its bundle-hash set equals the chain's for
+that round; a complete line whose set differs, an incomplete proposal never patched, or a round
+the sentry never wrote is a gap, never a sample. The `block` line is the round's proposal
+(pre-finality; the sentry's `commit` line follows one round later): this dataset scores the
+proposal because that is what a client acting on the stream sees, and the source is labelled so.
+Cohort strings gain `+quicknode-vpc` (`quicknode-peering-tcp+quicknode-vpc`, and the
+`hydromancer` and comparison variants), and because every VPC peering cohort has two or more
+sources the fastest-provider share is always published. Disclose which Quicknode endpoint the
+`quicknode-peering` leg dials on that box: a remote peering relay (a network hop) or the box's
+own sentry's gossip serve (no hop) — the first isolates endpoint versus box, the second isolates
+decode plus socket cost.
 
 ## Mempool bundle readiness
 

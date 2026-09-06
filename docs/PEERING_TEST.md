@@ -101,6 +101,31 @@ every box asymmetry that Protocol 2 below has to argue away, at the cost of
 requiring dual admission. Disclose the observer's network distance to each
 service endpoint (RTT); it is part of the result.
 
+### Tier A on the Quicknode VPC box — the wire and the decoded stream, one box
+
+A Quicknode VPC box runs the sentry and a Hyperliquid node on one machine, and a client on
+that box can read the sentry's decoded stream: one JSON line per consensus round, written when
+the round's ordering frame arrives with every bundle decoded (the product's pre-confirmation
+surface). The collector on that box adds it as a third kind of leg:
+
+```bash
+PEERING_PROVIDER=quicknode \
+QUICKNODE_PEERING_ENDPOINT=<a Quicknode gossip serve host:port this box is admitted to> \
+VPC_DECODED_SOCKET=<the box's sentry decoded stream host:port> \
+PEERING_REFERENCE_FEED=<your node host:9464> \
+hyperliquid-market-benchmark --dataset peering --coins BLOCKS
+```
+
+The `quicknode-vpc` leg's boundary is *the complete `block` line for the round has been fully
+read from the socket* — block-ready plus the sentry's decode, serialisation and the socket hop.
+Its rows are admitted only when the line's bundle-hash set equals the reference feed's for that
+round. Two disclosures are mandatory on top of the list above: (a) the line is the round's
+**proposal** (the sentry's `commit` line follows one round later), and (b) which Quicknode
+endpoint the `quicknode-peering` leg dials — the box's own sentry (no network hop; the pair
+then measures decode plus socket cost) or a remote Quicknode relay (the pair then measures
+endpoint versus box). Only a collector on the VPC box can produce these rows; the socket is
+bound to the box.
+
 ## Tier B — node-applied, or "anyone can referee"
 
 Tier B needs nothing but a stock node and one standard-library script. It

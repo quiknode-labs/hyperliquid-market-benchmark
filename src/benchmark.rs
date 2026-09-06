@@ -69,8 +69,9 @@ pub struct BenchmarkConfig {
     /// Which peering service(s) the peering dataset dials and stamps. Ignored
     /// by every other dataset, which keeps its static provider set.
     pub peering_mode: PeeringMode,
-    /// The collector runs on a Quicknode VPC box and reads that box's node output as the
-    /// `quicknode-vpc` provider (fills today). Widens the fills cohort to three sources.
+    /// The collector runs on a Quicknode VPC box and reads a local surface of the product as the
+    /// `quicknode-vpc` provider: the node's own fills output (fills) or the co-located sentry's
+    /// decoded stream socket (peering). Widens that dataset's cohort by one source.
     pub vpc_local: bool,
 }
 
@@ -111,6 +112,7 @@ impl BenchmarkConfig {
 impl BenchmarkConfig {
     pub fn providers(&self) -> &'static [Provider] {
         match self.dataset {
+            Dataset::Peering if self.vpc_local => self.peering_mode.vpc_providers(),
             Dataset::Peering => self.peering_mode.providers(),
             Dataset::Fills if self.vpc_local => &FILLS_VPC_PROVIDERS,
             _ => self.dataset.providers(),
@@ -119,6 +121,7 @@ impl BenchmarkConfig {
 
     pub fn cohort(&self) -> &'static str {
         match self.dataset {
+            Dataset::Peering if self.vpc_local => self.peering_mode.vpc_cohort(),
             Dataset::Peering => self.peering_mode.cohort(),
             Dataset::Fills if self.vpc_local => FILLS_VPC_COHORT,
             _ => self.dataset.cohort(),
@@ -134,6 +137,8 @@ impl BenchmarkConfig {
 
     pub fn has_provider_comparison(&self) -> bool {
         match self.dataset {
+            // The VPC leg always makes a peering cohort at least two sources wide.
+            Dataset::Peering if self.vpc_local => true,
             Dataset::Peering => self.peering_mode.has_provider_comparison(),
             _ => self.dataset.has_provider_comparison(),
         }
@@ -2846,6 +2851,48 @@ mod tests {
         );
         mempool.vpc_local = true;
         assert_eq!(mempool.providers(), &[Provider::QuickNodeGrpc]);
+    }
+
+    #[test]
+    fn vpc_local_adds_the_decoded_stream_leg_to_every_peering_mode() {
+        let mut config = BenchmarkConfig::production(
+            Dataset::Peering,
+            vec!["BLOCKS".to_owned()],
+            "teraswitch".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "teraswitch-nrt-01".to_owned(),
+            "test-run".to_owned(),
+        );
+        assert!(!config.has_provider_comparison());
+        config.vpc_local = true;
+        assert_eq!(
+            config.providers(),
+            &[Provider::QuickNodePeeringTcp, Provider::QuickNodeVpc]
+        );
+        assert_eq!(config.cohort(), "quicknode-peering-tcp+quicknode-vpc");
+        assert!(config.has_provider_comparison());
+        // Content is the round itself, so no leg is the canonical reference.
+        assert!(config.canonical_by_any_arrival());
+        config.peering_mode = PeeringMode::Comparison;
+        assert_eq!(
+            config.providers(),
+            &[
+                Provider::QuickNodePeeringTcp,
+                Provider::HydromancerPeeringTcp,
+                Provider::QuickNodeVpc
+            ]
+        );
+        assert_eq!(
+            config.cohort(),
+            "quicknode-peering-tcp+hydromancer-peering-tcp+quicknode-vpc"
+        );
+        config.peering_mode = PeeringMode::Hydromancer;
+        assert_eq!(
+            config.providers(),
+            &[Provider::HydromancerPeeringTcp, Provider::QuickNodeVpc]
+        );
+        assert_eq!(config.cohort(), "hydromancer-peering-tcp+quicknode-vpc");
     }
     #[test]
     fn vpc_and_grpc_rows_in_one_window_have_distinct_event_ids() {

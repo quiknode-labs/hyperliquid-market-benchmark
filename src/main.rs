@@ -89,6 +89,13 @@ struct Args {
     #[arg(long, env = "VPC_NODE_DATA")]
     vpc_node_data: Option<PathBuf>,
 
+    /// `host:port` of the co-located Quicknode sentry's decoded stream (its LANERACER_DECODED_TCP
+    /// listener) on THIS box. Enables the `quicknode-vpc` provider for the peering dataset only:
+    /// the sentry's `block` line for each consensus round joins the cohort beside the peering
+    /// service(s) this process dials, observed by this one process with one clock. See METHODOLOGY.
+    #[arg(long, env = "VPC_DECODED_SOCKET")]
+    vpc_decoded_socket: Option<String>,
+
     /// Cloud measurement location. Inferred from the public runner ID when absent.
     #[arg(long, env = "BENCHMARK_CLOUD")]
     cloud: Option<String>,
@@ -278,7 +285,13 @@ async fn main() -> Result<()> {
     config.artifact_sha256 = artifact_sha256;
     config.peering_mode = peering_mode;
     let vpc_node_data = validate_vpc_node_data(args.dataset, args.vpc_node_data.clone())?;
-    config.vpc_local = vpc_node_data.is_some();
+    let vpc_decoded_socket = validate_vpc_decoded_socket(
+        args.dataset,
+        args.vpc_decoded_socket.clone(),
+        &peering_endpoints,
+        &peering_reference,
+    )?;
+    config.vpc_local = vpc_node_data.is_some() || vpc_decoded_socket.is_some();
     let mut benchmark = Benchmark::new(config, now, wall_now);
 
     let signals = Arc::new(RuntimeSignals::new(&coins));
@@ -296,6 +309,7 @@ async fn main() -> Result<()> {
             peering_endpoints,
             peering_reference,
             vpc_node_data,
+            vpc_decoded_socket,
         },
         sender,
     );
@@ -541,6 +555,36 @@ fn validate_vpc_node_data(dataset: Dataset, path: Option<PathBuf>) -> Result<Opt
     Ok(Some(path))
 }
 
+/// The decoded stream socket is a peering-only source, and it may never be the same wire as a
+/// dialed peering endpoint or the reference feed: one socket is scored once, under one name.
+fn validate_vpc_decoded_socket(
+    dataset: Dataset,
+    socket: Option<String>,
+    peering_endpoints: &[(Provider, String)],
+    peering_reference: &str,
+) -> Result<Option<String>> {
+    let Some(socket) = socket else {
+        return Ok(None);
+    };
+    if dataset != Dataset::Peering {
+        anyhow::bail!(
+            "--vpc-decoded-socket (VPC_DECODED_SOCKET) is only supported for the peering dataset, not {}",
+            dataset.label()
+        );
+    }
+    peering::validate_peering_endpoint(&socket, "decoded stream socket")?;
+    if peering_endpoints
+        .iter()
+        .any(|(_, endpoint)| *endpoint == socket)
+        || peering_reference == socket
+    {
+        anyhow::bail!(
+            "--vpc-decoded-socket {socket} is already dialed as a peering endpoint or the reference feed; one wire is never scored twice"
+        );
+    }
+    Ok(Some(socket))
+}
+
 fn infer_location(runner: &str) -> (Option<String>, Option<String>, Option<String>) {
     let parts = runner
         .split(['-', '.'])
@@ -676,6 +720,68 @@ mod tests {
                 PeeringMode::Comparison,
                 quicknode,
                 Some("tcp://x.test:4001")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn vpc_decoded_socket_is_peering_only_and_never_a_dialed_wire() {
+        let dialed = vec![(
+            Provider::QuickNodePeeringTcp,
+            "203.0.113.10:4001".to_owned(),
+        )];
+        let reference = "203.0.113.20:9464";
+        assert!(
+            validate_vpc_decoded_socket(Dataset::Peering, None, &dialed, reference)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            validate_vpc_decoded_socket(
+                Dataset::Peering,
+                Some("203.0.113.10:4011".to_owned()),
+                &dialed,
+                reference
+            )
+            .unwrap(),
+            Some("203.0.113.10:4011".to_owned())
+        );
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Fills,
+                Some("203.0.113.10:4011".to_owned()),
+                &dialed,
+                reference
+            )
+            .is_err()
+        );
+        // The sentry's gossip serve and its decoded socket are different wires; the same
+        // address twice would score one wire under two names.
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Peering,
+                Some("203.0.113.10:4001".to_owned()),
+                &dialed,
+                reference
+            )
+            .is_err()
+        );
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Peering,
+                Some(reference.to_owned()),
+                &dialed,
+                reference
+            )
+            .is_err()
+        );
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Peering,
+                Some("tcp://x.test:4011".to_owned()),
+                &dialed,
+                reference
             )
             .is_err()
         );

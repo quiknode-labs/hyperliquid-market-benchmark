@@ -35,6 +35,19 @@ pub const PEERING_COMPARISON_PROVIDERS: [Provider; 2] = [
     Provider::QuickNodePeeringTcp,
     Provider::HydromancerPeeringTcp,
 ];
+/// Peering with the Quicknode VPC source: the collector runs on the VPC box and reads the
+/// co-located sentry's decoded stream socket beside the peering service(s) it dials, so the
+/// sentry's pre-confirmation `block` line is scored in the same per-round cohort as block-ready
+/// on the gossip wire. One extra leg per mode; the dialed services are unchanged.
+pub const PEERING_VPC_PROVIDERS: [Provider; 2] =
+    [Provider::QuickNodePeeringTcp, Provider::QuickNodeVpc];
+pub const HYDROMANCER_PEERING_VPC_PROVIDERS: [Provider; 2] =
+    [Provider::HydromancerPeeringTcp, Provider::QuickNodeVpc];
+pub const PEERING_COMPARISON_VPC_PROVIDERS: [Provider; 3] = [
+    Provider::QuickNodePeeringTcp,
+    Provider::HydromancerPeeringTcp,
+    Provider::QuickNodeVpc,
+];
 
 /// Which peering service(s) one `peering` process dials. `Comparison` dials
 /// both from the same observer and forms one exact two-source cohort per
@@ -61,6 +74,25 @@ impl PeeringMode {
             Self::Quicknode => "quicknode-peering-tcp",
             Self::Hydromancer => "hydromancer-peering-tcp",
             Self::Comparison => "quicknode-peering-tcp+hydromancer-peering-tcp",
+        }
+    }
+
+    /// The same mode with the Quicknode VPC leg added (collector on the VPC box reading the
+    /// co-located sentry's decoded stream). Every VPC cohort has at least two sources, so it
+    /// always carries a fastest-provider share.
+    pub const fn vpc_providers(self) -> &'static [Provider] {
+        match self {
+            Self::Quicknode => &PEERING_VPC_PROVIDERS,
+            Self::Hydromancer => &HYDROMANCER_PEERING_VPC_PROVIDERS,
+            Self::Comparison => &PEERING_COMPARISON_VPC_PROVIDERS,
+        }
+    }
+
+    pub const fn vpc_cohort(self) -> &'static str {
+        match self {
+            Self::Quicknode => "quicknode-peering-tcp+quicknode-vpc",
+            Self::Hydromancer => "hydromancer-peering-tcp+quicknode-vpc",
+            Self::Comparison => "quicknode-peering-tcp+hydromancer-peering-tcp+quicknode-vpc",
         }
     }
 
@@ -175,8 +207,9 @@ pub enum Provider {
     QuickNodePeeringTcp,
     HydromancerPeeringTcp,
     /// The Quicknode VPC product read on the box that runs it: a Hyperliquid node fed by a
-    /// co-located Quicknode sentry, observed through the node's own output files. Only a collector
-    /// running on that box can stamp this provider; it never appears from a network observer.
+    /// co-located Quicknode sentry, observed through the node's own output files (fills) or the
+    /// sentry's decoded stream socket (peering). Only a collector running on that box can stamp
+    /// this provider; it never appears from a network observer.
     QuickNodeVpc,
 }
 

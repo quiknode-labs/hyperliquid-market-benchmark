@@ -57,6 +57,10 @@ pub struct StreamConfig {
     /// `quicknode-vpc` provider: the same per-user fill pairs the Quicknode gRPC feed carries,
     /// reconstructed with the same rule, stamped when the line becomes readable here.
     pub vpc_node_data: Option<std::path::PathBuf>,
+    /// `host:port` of the co-located Quicknode sentry's decoded stream on THIS box. When set for
+    /// the peering dataset, each `block` line the sentry writes is scored as the `quicknode-vpc`
+    /// provider in the same per-round cohort as the dialed peering service(s).
+    pub vpc_decoded_socket: Option<String>,
 }
 
 pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandle<()>> {
@@ -108,6 +112,14 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
                 tasks.push(tokio::spawn(crate::peering::run_peering(
                     *provider,
                     endpoint.clone(),
+                    config.peering_reference.clone(),
+                    coin.clone(),
+                    sender.clone(),
+                )));
+            }
+            if let Some(socket) = &config.vpc_decoded_socket {
+                tasks.push(tokio::spawn(crate::peering::run_vpc_decoded(
+                    socket.clone(),
                     config.peering_reference.clone(),
                     coin.clone(),
                     sender.clone(),

@@ -163,7 +163,7 @@ explicit incomplete cohort without stopping the other streams. Every
 30-second window must be durably admitted within 20 seconds; if local
 publication stalls, the process exits so its service supervisor can restart it.
 
-### The Quicknode VPC source (fills, on the VPC box)
+### The Quicknode VPC source (fills and peering, on the VPC box)
 
 A collector running on a Quicknode VPC box (sentry + Hyperliquid node on one machine) can add
 the box's own node output to the fills cohort:
@@ -178,6 +178,20 @@ Quicknode gRPC and Foundation subscriptions the same process holds, so the three
 exact cohort per trade with one clock (`docs/METHODOLOGY.md`, "The Quicknode VPC source"). It is
 refused for any other dataset and when the directory has no fills tree. The runner is public
 like every other (`cloud` `teraswitch`).
+
+For peering the same box adds the sentry's own decoded stream — the customer-facing socket that
+writes each consensus round's decoded `block` line as the ordering arrives — as the
+`quicknode-vpc` leg beside the dialed peering service(s):
+
+```bash
+PEERING_PROVIDER=quicknode QUICKNODE_PEERING_ENDPOINT=<gossip serve host:port> \
+PEERING_REFERENCE_FEED=<node host:9464> VPC_DECODED_SOCKET=<sentry decoded host:port> \
+hyperliquid-market-benchmark --dataset peering --coins BLOCKS --runner teraswitch-nrt-01
+```
+
+`--vpc-decoded-socket` is refused for any other dataset and when it names a wire the process
+already dials. The leg is stamped when the complete line is read from the socket and admitted only
+when its bundle set equals the chain's (`docs/PEERING_TEST.md`, "Tier A on the Quicknode VPC box").
 
 ## Public observer identity
 

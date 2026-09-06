@@ -252,21 +252,7 @@ async fn run_peering_once(
 ) -> Result<()> {
     // Reference feed first: samples cannot close without it, and its rounds
     // anchor the plausibility window for ordering extraction.
-    let reference = TcpStream::connect(reference_endpoint)
-        .await
-        .context("connect peering reference feed")?;
-    let (ref_tx, mut ref_rx) = mpsc::channel::<ReferenceLine>(4096);
-    let reference_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(reference).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(parsed) = serde_json::from_str::<ReferenceLine>(&line) else {
-                continue;
-            };
-            if ref_tx.send(parsed).await.is_err() {
-                break;
-            }
-        }
-    });
+    let (reference_task, mut ref_rx) = spawn_reference_reader(reference_endpoint).await?;
 
     let mut stream = TcpStream::connect(endpoint)
         .await
@@ -322,6 +308,294 @@ async fn run_peering_once(
             return Ok(());
         }
     }
+}
+
+/// Longest decoded line accepted from the sentry socket. A 2 000-action block serialises to a
+/// few MiB; anything past this is a desynced or hostile stream, not data.
+const MAX_DECODED_LINE: usize = 64 * 1024 * 1024;
+
+/// One line of the co-located sentry's decoded stream, read for the fields the round join
+/// needs. `block` and `block_patch` carry the round's bundle hashes in execution order; every
+/// other line type (`commit`, `skip`, `orphan`) is skipped. Shape: hl-relay
+/// `docs/decoded-stream-schema.md`.
+#[derive(Debug, Deserialize)]
+struct DecodedLine {
+    #[serde(rename = "type")]
+    kind: String,
+    round: u64,
+    #[serde(default)]
+    complete: bool,
+    #[serde(default)]
+    signed_action_bundles: Vec<(String, serde::de::IgnoredAny)>,
+}
+
+#[derive(Debug, Default)]
+struct DecodedRound {
+    /// First complete `block`/`block_patch` line: arrival, arrival wall ms, sorted bundle hashes.
+    line: Option<(Instant, u64, Vec<[u8; 32]>)>,
+    /// Reference feed: producer time ms, sorted bundle hashes.
+    reference: Option<(u64, Vec<[u8; 32]>)>,
+    first_seen: Option<Instant>,
+    reported: bool,
+}
+
+/// Joins the sentry's decoded `block` lines with the reference feed by round. A round is READY
+/// for the VPC leg when a complete line has been fully read from the socket and its bundle hash
+/// set equals the chain's (from the reference feed). A complete line whose bundle set differs,
+/// an incomplete line never patched, or a round the sentry never wrote is a gap, never a sample.
+struct DecodedAssembly {
+    coin: String,
+    rounds: HashMap<u64, DecodedRound>,
+    max_ref_round: u64,
+}
+
+impl DecodedAssembly {
+    fn new(coin: String) -> Self {
+        Self {
+            coin,
+            rounds: HashMap::new(),
+            max_ref_round: 0,
+        }
+    }
+
+    fn track_line(&mut self, line: DecodedLine, arrival: Instant, wall_ms: u64) {
+        if line.kind != "block" && line.kind != "block_patch" {
+            return;
+        }
+        // Same plausibility window as the wire path: no anchor, no tracking.
+        if self.max_ref_round == 0 || line.round.abs_diff(self.max_ref_round) > ROUND_WINDOW {
+            return;
+        }
+        let entry = self.rounds.entry(line.round).or_default();
+        entry.first_seen.get_or_insert(arrival);
+        if !line.complete || entry.line.is_some() {
+            // An incomplete proposal waits for its `block_patch`; a re-sent complete line
+            // never moves the boundary.
+            return;
+        }
+        let mut hashes = Vec::with_capacity(line.signed_action_bundles.len());
+        for (hash, _) in &line.signed_action_bundles {
+            let Some(hash) = parse_hex32(hash) else {
+                return;
+            };
+            hashes.push(hash);
+        }
+        hashes.sort_unstable();
+        entry.line = Some((arrival, wall_ms, hashes));
+    }
+
+    fn track_reference(&mut self, line: ReferenceLine) {
+        let Some(time_ms) = parse_reference_time_ms(&line.t) else {
+            return;
+        };
+        let mut hashes = Vec::with_capacity(line.b.len());
+        for (hash, _first_r, _count) in &line.b {
+            let Some(hash) = parse_hex32(hash) else {
+                return;
+            };
+            hashes.push(hash);
+        }
+        hashes.sort_unstable();
+        self.max_ref_round = self.max_ref_round.max(line.r);
+        let entry = self.rounds.entry(line.r).or_default();
+        entry.first_seen.get_or_insert(Instant::now());
+        entry.reference = Some((time_ms, hashes));
+    }
+
+    /// Ready events plus the number of rounds that closed without a sample (each counted once).
+    fn drain_ready(&mut self, now: Instant) -> (Vec<MarketEvent>, u64) {
+        let mut ready = Vec::new();
+        let mut gaps = 0u64;
+        for (round, tracked) in self.rounds.iter_mut() {
+            if tracked.reported {
+                continue;
+            }
+            match (&tracked.line, &tracked.reference) {
+                (Some((arrived, wall, hashes)), Some((time_ms, reference_hashes))) => {
+                    tracked.reported = true;
+                    if hashes != reference_hashes {
+                        // The sentry's block is not the chain's block: an integrity failure,
+                        // counted and excluded.
+                        gaps += 1;
+                        continue;
+                    }
+                    ready.push(MarketEvent {
+                        provider: Provider::QuickNodeVpc,
+                        key: EventKey {
+                            coin: self.coin.clone(),
+                            event_ms: *time_ms,
+                            content: ContentKey::Peering { round: *round },
+                        },
+                        received: *arrived,
+                        received_wall_ms: *wall,
+                    });
+                }
+                _ => {
+                    if tracked
+                        .first_seen
+                        .is_some_and(|seen| now.duration_since(seen) > INCOMPLETE_DEADLINE)
+                    {
+                        tracked.reported = true;
+                        gaps += 1;
+                    }
+                }
+            }
+        }
+        let floor = self.max_ref_round.saturating_sub(ROUND_RETAIN);
+        self.rounds.retain(|round, _| *round >= floor);
+        (ready, gaps)
+    }
+}
+
+/// The Quicknode VPC peering leg: subscribe to the co-located sentry's decoded stream socket and
+/// score each round's `block` line beside the dialed peering service(s). Only a collector on the
+/// VPC box can run this; the socket is bound to that box.
+pub async fn run_vpc_decoded(
+    endpoint: String,
+    reference_endpoint: String,
+    coin: String,
+    sender: ProbeSender,
+) {
+    let provider = Provider::QuickNodeVpc;
+    let mut backoff = ReconnectBackoff::default();
+    loop {
+        let started = Instant::now();
+        match run_vpc_decoded_once(&endpoint, &reference_endpoint, &coin, &sender).await {
+            Ok(()) => warn!(%coin, "decoded stream ended"),
+            Err(error) => warn!(%coin, ?error, "decoded stream disconnected"),
+        }
+        if !sender
+            .send(ProbeEvent::Reconnect {
+                provider,
+                coin: coin.clone(),
+            })
+            .await
+        {
+            return;
+        }
+        tokio::time::sleep(backoff.after_connection(started.elapsed())).await;
+    }
+}
+
+async fn run_vpc_decoded_once(
+    endpoint: &str,
+    reference_endpoint: &str,
+    coin: &str,
+    sender: &ProbeSender,
+) -> Result<()> {
+    let (reference_task, mut ref_rx) = spawn_reference_reader(reference_endpoint).await?;
+    let stream = TcpStream::connect(endpoint)
+        .await
+        .context("connect decoded stream socket")?;
+    let _connection = sender.connected(Provider::QuickNodeVpc, coin);
+
+    let mut reader = BufReader::with_capacity(1 << 20, stream);
+    let mut line: Vec<u8> = Vec::with_capacity(1 << 20);
+    let mut assembly = DecodedAssembly::new(coin.to_owned());
+    let mut maintenance = tokio::time::interval(Duration::from_millis(500));
+
+    loop {
+        tokio::select! {
+            read = tokio::time::timeout(READ_DEADLINE, read_bounded_line(&mut reader, &mut line)) => {
+                let complete = read.context("decoded stream read deadline exceeded")??;
+                if !complete {
+                    anyhow::bail!("decoded stream socket closed");
+                }
+                // The boundary: the whole line is readable by a client on the box.
+                let arrival = Instant::now();
+                let wall_ms = now_ms();
+                if let Ok(parsed) = serde_json::from_slice::<DecodedLine>(&line) {
+                    assembly.track_line(parsed, arrival, wall_ms);
+                }
+                line.clear();
+            }
+            reference = ref_rx.recv() => {
+                let Some(reference) = reference else {
+                    anyhow::bail!("peering reference feed ended");
+                };
+                assembly.track_reference(reference);
+            }
+            _ = maintenance.tick() => {}
+        }
+        let (ready, gaps) = assembly.drain_ready(Instant::now());
+        for event in ready {
+            if !sender.send(ProbeEvent::Market(event)).await {
+                reference_task.abort();
+                return Ok(());
+            }
+        }
+        if gaps > 0
+            && !sender
+                .send(ProbeEvent::SequenceGap {
+                    provider: Provider::QuickNodeVpc,
+                    coin: coin.to_owned(),
+                    missing: gaps,
+                })
+                .await
+        {
+            reference_task.abort();
+            return Ok(());
+        }
+    }
+}
+
+/// Append one newline-terminated line to `line` (without the newline). Returns `Ok(false)` at
+/// EOF. Cancel-safe: bytes already moved into `line` stay there, so a caller that drops the
+/// future mid-line and calls again continues the same line. Bounded by `MAX_DECODED_LINE`.
+async fn read_bounded_line(reader: &mut BufReader<TcpStream>, line: &mut Vec<u8>) -> Result<bool> {
+    loop {
+        let (found, consumed) = {
+            let available = reader
+                .fill_buf()
+                .await
+                .context("read decoded stream socket")?;
+            if available.is_empty() {
+                return Ok(false);
+            }
+            match available.iter().position(|&byte| byte == b'\n') {
+                Some(pos) => {
+                    line.extend_from_slice(&available[..pos]);
+                    (true, pos + 1)
+                }
+                None => {
+                    line.extend_from_slice(available);
+                    (false, available.len())
+                }
+            }
+        };
+        reader.consume(consumed);
+        if found {
+            return Ok(true);
+        }
+        if line.len() > MAX_DECODED_LINE {
+            anyhow::bail!(
+                "decoded stream line exceeds {MAX_DECODED_LINE} bytes without a newline: stream desync"
+            );
+        }
+    }
+}
+
+/// Connect the reference feed and parse its NDJSON on a task. Samples cannot close without it,
+/// and its rounds anchor the plausibility window, so every leg opens it first.
+async fn spawn_reference_reader(
+    reference_endpoint: &str,
+) -> Result<(tokio::task::JoinHandle<()>, mpsc::Receiver<ReferenceLine>)> {
+    let reference = TcpStream::connect(reference_endpoint)
+        .await
+        .context("connect peering reference feed")?;
+    let (ref_tx, ref_rx) = mpsc::channel::<ReferenceLine>(4096);
+    let task = tokio::spawn(async move {
+        let mut lines = BufReader::new(reference).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(parsed) = serde_json::from_str::<ReferenceLine>(&line) else {
+                continue;
+            };
+            if ref_tx.send(parsed).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok((task, ref_rx))
 }
 
 /// Drain complete frames from the reassembly buffer, feeding the assembler.
@@ -776,5 +1050,156 @@ mod tests {
             Some(1_786_372_995_093)
         );
         assert!(parse_reference_time_ms("not a time").is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod decoded_tests {
+    use super::*;
+
+    fn hex32(byte: u8) -> String {
+        format!("0x{}", format!("{byte:02x}").repeat(32))
+    }
+
+    fn reference(round: u64, time: &str, hashes: &[u8]) -> ReferenceLine {
+        ReferenceLine {
+            r: round,
+            t: time.to_owned(),
+            b: hashes
+                .iter()
+                .map(|byte| (hex32(*byte), Some(hex32(0xee)), 1u64))
+                .collect(),
+        }
+    }
+
+    fn block_line(kind: &str, round: u64, complete: bool, hashes: &[u8]) -> DecodedLine {
+        let bundles = hashes
+            .iter()
+            .map(|byte| {
+                format!(
+                    "[\"{}\",{{\"first_recv_ns\":1,\"copies\":2,\"raw_frame\":false,\"signed_actions\":[{{\"action\":{{\"type\":\"noop\"}}}}]}}]",
+                    hex32(*byte)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            "{{\"type\":\"{kind}\",\"round\":{round},\"parent_round\":{},\"proposer\":\"0x00\",\"relay_recv_ns\":1,\"emit_ns\":2,\"lane\":3,\"complete\":{complete},\"missing\":[],\"signed_action_bundles\":[{bundles}]}}",
+            round - 1
+        );
+        serde_json::from_str(&json).expect("decoded block line parses")
+    }
+
+    #[test]
+    fn a_complete_block_line_with_the_chains_bundle_set_is_the_vpc_sample() {
+        let mut assembly = DecodedAssembly::new("BLOCKS".to_owned());
+        let t0 = Instant::now();
+        // Lines before the reference anchor are not tracked (same window rule as the wire).
+        assembly.track_line(block_line("block", 500, true, &[0x11]), t0, 1_000);
+        assembly.track_reference(reference(500, "2026-08-10T14:43:15.093322286", &[0x11]));
+        let (ready, gaps) = assembly.drain_ready(t0);
+        assert!(ready.is_empty());
+        assert_eq!(gaps, 0);
+
+        assembly.track_line(
+            block_line("block", 500, true, &[0x11]),
+            t0 + Duration::from_millis(80),
+            1_080,
+        );
+        let (ready, gaps) = assembly.drain_ready(t0 + Duration::from_millis(81));
+        assert_eq!(gaps, 0);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].provider, Provider::QuickNodeVpc);
+        assert_eq!(ready[0].key.event_ms, 1_786_372_995_093);
+        assert_eq!(ready[0].key.content, ContentKey::Peering { round: 500 });
+        assert_eq!(ready[0].received, t0 + Duration::from_millis(80));
+        assert_eq!(ready[0].received_wall_ms, 1_080);
+        // One sample per round; a re-served line never produces a second one.
+        assembly.track_line(block_line("block", 500, true, &[0x11]), t0, 1_000);
+        assert!(assembly.drain_ready(t0 + Duration::from_secs(1)).0.is_empty());
+    }
+
+    #[test]
+    fn bundle_order_does_not_matter_but_the_set_must_match() {
+        let mut assembly = DecodedAssembly::new("BLOCKS".to_owned());
+        let t0 = Instant::now();
+        assembly.track_reference(reference(600, "2026-08-10T14:43:15.093322286", &[0x11, 0x22]));
+        assembly.track_reference(reference(601, "2026-08-10T14:43:15.160000000", &[0x33]));
+        assembly.track_line(block_line("block", 600, true, &[0x22, 0x11]), t0, 1);
+        assembly.track_line(block_line("block", 601, true, &[0x44]), t0, 2);
+        let (ready, gaps) = assembly.drain_ready(t0);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].key.content, ContentKey::Peering { round: 600 });
+        // A block that is not the chain's block is a gap, counted once, never a sample.
+        assert_eq!(gaps, 1);
+        assert_eq!(assembly.drain_ready(t0 + Duration::from_secs(10)).1, 0);
+    }
+
+    #[test]
+    fn an_incomplete_proposal_is_timed_at_its_patch_or_expires_as_a_gap() {
+        let mut assembly = DecodedAssembly::new("BLOCKS".to_owned());
+        let t0 = Instant::now();
+        assembly.track_reference(reference(700, "2026-08-10T14:43:15.093322286", &[0x11]));
+        assembly.track_reference(reference(701, "2026-08-10T14:43:15.160000000", &[0x22]));
+        assembly.track_line(block_line("block", 700, false, &[]), t0, 1);
+        assembly.track_line(block_line("block", 701, false, &[]), t0, 1);
+        assert!(assembly.drain_ready(t0 + Duration::from_secs(1)).0.is_empty());
+        assembly.track_line(
+            block_line("block_patch", 700, true, &[0x11]),
+            t0 + Duration::from_millis(300),
+            301,
+        );
+        let (ready, gaps) = assembly.drain_ready(t0 + Duration::from_secs(2));
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].received, t0 + Duration::from_millis(300));
+        assert_eq!(gaps, 0);
+        // 701 never completed within the deadline: one gap, once.
+        assert_eq!(assembly.drain_ready(t0 + Duration::from_secs(6)).1, 1);
+        assert_eq!(assembly.drain_ready(t0 + Duration::from_secs(7)).1, 0);
+    }
+
+    #[test]
+    fn commit_skip_and_orphan_lines_are_not_samples() {
+        let mut assembly = DecodedAssembly::new("BLOCKS".to_owned());
+        let t0 = Instant::now();
+        assembly.track_reference(reference(800, "2026-08-10T14:43:15.093322286", &[]));
+        for kind in ["commit", "skip", "orphan"] {
+            let line: DecodedLine = serde_json::from_str(&format!(
+                "{{\"type\":\"{kind}\",\"round\":800,\"relay_recv_ns\":1,\"emit_ns\":2,\"lane\":3}}"
+            ))
+            .unwrap();
+            assembly.track_line(line, t0, 1);
+        }
+        assert!(assembly.drain_ready(t0).0.is_empty());
+        // An empty block (no bundles) still needs its `block` line to be a sample.
+        assembly.track_line(block_line("block", 800, true, &[]), t0, 1);
+        assert_eq!(assembly.drain_ready(t0).0.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_returns_whole_lines_and_survives_split_reads() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"{\"a\":1}\n{\"b\":").await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket.write_all(b"2}\n").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = Vec::new();
+        assert!(read_bounded_line(&mut reader, &mut line).await.unwrap());
+        assert_eq!(line, b"{\"a\":1}");
+        line.clear();
+        assert!(read_bounded_line(&mut reader, &mut line).await.unwrap());
+        assert_eq!(line, b"{\"b\":2}");
+        line.clear();
+        assert!(!read_bounded_line(&mut reader, &mut line).await.unwrap());
+        writer.await.unwrap();
     }
 }

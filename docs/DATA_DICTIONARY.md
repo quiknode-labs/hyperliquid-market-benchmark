@@ -61,7 +61,10 @@ consumer must not replace an omitted value with zero.
   `hydromancer`/`hydromancer-peering` for the Hydromancer service.
 - `cohort` names the exact set of services one process dialed:
   `quicknode-peering-tcp`, `hydromancer-peering-tcp`, or, in comparison mode,
-  `quicknode-peering-tcp+hydromancer-peering-tcp`.
+  `quicknode-peering-tcp+hydromancer-peering-tcp`. On the Quicknode VPC box each of
+  these gains `+quicknode-vpc` (the co-located sentry's decoded stream, `provider`
+  `quicknode`, `source` `quicknode-vpc`, `protocol` `local`; `METHODOLOGY.md`, "The
+  Quicknode VPC source"), and the fastest/tie counts are always published.
 - `schema` is `hyperliquid-market-benchmark-v4` and `measurement_version` is
   `peering-block-ready-v1`.
 - `sequence_gaps` counts consensus rounds that failed to complete (ordering or
@@ -113,7 +116,7 @@ Mempool has no provider race. It emits `outcome_count_scope=not-applicable`,
 | `outcome_interval_complete` | boolean | Exact nominal duration after startup and all cohort-health gates passed. |
 | `outcome_complete_cohort_count` | integer | Complete exact cohorts committed in this interval. |
 | `outcome_quicknode_strict_fastest_count` | integer | Cohorts with Quicknode (gRPC or peering, whichever the process dials) as the unique minimum absolute latency. |
-| `outcome_quicknode_vpc_strict_fastest_count` | integer | Cohorts with the Quicknode VPC leg as the unique minimum; zero unless the cohort is `hyperliquid-ws+quicknode-grpc+quicknode-vpc`. |
+| `outcome_quicknode_vpc_strict_fastest_count` | integer | Cohorts with the Quicknode VPC leg as the unique minimum; zero unless the cohort contains `quicknode-vpc` (fills `hyperliquid-ws+quicknode-grpc+quicknode-vpc`; peering `quicknode-peering-tcp+quicknode-vpc` and its variants). |
 | `outcome_foundation_strict_fastest_count` | integer | Cohorts with Foundation as the unique minimum. |
 | `outcome_hydromancer_strict_fastest_count` | integer | Cohorts with Hydromancer as the unique minimum. |
 | `outcome_tie_count` | integer | Cohorts whose minimum was shared by at least two paths. |
