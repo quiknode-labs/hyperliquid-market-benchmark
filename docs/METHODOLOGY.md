@@ -62,7 +62,7 @@ canonical trade. This measures public trade-feed delivery. It does not measure
 customer order submission, acknowledgement, order-to-fill, or exchange
 matching-engine execution latency.
 
-## The Quicknode VPC source (fills and peering)
+## The Quicknode VPC source (fills, peering and mempool)
 
 A Quicknode VPC box runs a Hyperliquid node fed by a co-located Quicknode sentry, and the
 customer's own client runs on that box. Its fills are measured the only honest way a
@@ -105,6 +105,23 @@ sources the fastest-provider share is always published. Disclose which Quicknode
 `quicknode-peering` leg dials on that box: a remote peering relay (a network hop) or the box's
 own sentry's gossip serve (no hop) — the first isolates endpoint versus box, the second isolates
 decode plus socket cost.
+
+**Mempool.** The sentry's `bundle` line — one per decoded bundle body, written when its signers
+are recovered, about 140 ms before the ordering that includes it — is the box's pre-consensus
+surface, and on the box it is the `quicknode-vpc` mempool leg beside the Quicknode gRPC mempool
+stream. The two legs cannot share the stream's embedded first-seen timestamp (the sentry line does
+not carry it, and it is another node's clock), so on the box the dataset changes its reference:
+both legs are timed from the **box's first sight** of the bundle — the sentry's receipt time from
+the `bundle` line, or the arrival of the same bundle at the collector if that came first, so no leg
+is ever negative. Rows carry `metric_kind` `box_first_seen_to_bundle_ready` and
+`measurement_version` `mempool-box-first-seen-v1` under the unchanged mempool schema, cohort
+`quicknode-grpc+quicknode-vpc`, one exact two-source cohort per BTC bundle keyed by tx hash (the
+sentry's bundle hash and the node's `mempool_txs` `tx_hash` are the same value). The BTC filter is
+the one the gRPC leg already applies, evaluated on the decoded actions. A bundle the endpoint
+delivered that the sentry never saw is a gap charged to the VPC leg; a bundle the sentry saw that
+the endpoint never sent is scored missing for the endpoint. Off the box the mempool dataset is
+unchanged. The `bundle` line is pre-consensus: the number says how early each path hands a client
+the transactions, not that they will execute.
 
 ## Mempool bundle readiness
 

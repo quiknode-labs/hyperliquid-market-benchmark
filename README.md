@@ -163,7 +163,7 @@ explicit incomplete cohort without stopping the other streams. Every
 30-second window must be durably admitted within 20 seconds; if local
 publication stalls, the process exits so its service supervisor can restart it.
 
-### The Quicknode VPC source (fills and peering, on the VPC box)
+### The Quicknode VPC source (fills, peering and mempool, on the VPC box)
 
 A collector running on a Quicknode VPC box (sentry + Hyperliquid node on one machine) can add
 the box's own node output to the fills cohort:
@@ -192,6 +192,17 @@ hyperliquid-market-benchmark --dataset peering --coins BLOCKS --runner teraswitc
 `--vpc-decoded-socket` is refused for any other dataset and when it names a wire the process
 already dials. The leg is stamped when the complete line is read from the socket and admitted only
 when its bundle set equals the chain's (`docs/PEERING_TEST.md`, "Tier A on the Quicknode VPC box").
+
+For mempool the same socket's `bundle` lines are the `quicknode-vpc` leg beside the Quicknode gRPC
+mempool stream, both timed from the box's first sight of each BTC bundle:
+
+```bash
+VPC_DECODED_SOCKET=<sentry decoded host:port> \
+hyperliquid-market-benchmark --dataset mempool --coins BTC --runner teraswitch-nrt-01
+```
+
+Rows then carry `metric_kind` `box_first_seen_to_bundle_ready` (`docs/METHODOLOGY.md`, "The
+Quicknode VPC source", mempool paragraph).
 
 ## Public observer identity
 

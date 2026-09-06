@@ -48,7 +48,7 @@ consumer must not replace an omitted value with zero.
 | `window_end` | RFC 3339 string | End of the rolling distribution. |
 | `window_seconds` | integer | Rolling distribution duration; currently 300. |
 | `publish_interval_seconds` | integer | Nominal publication cadence; currently 30. |
-| `cohort` | string | Exact dataset-specific source set. Mempool uses the one-source value `quicknode-grpc`. |
+| `cohort` | string | Exact dataset-specific source set. Mempool uses the one-source value `quicknode-grpc`; on the Quicknode VPC box it is `quicknode-grpc+quicknode-vpc` with `metric_kind` `box_first_seen_to_bundle_ready` and `measurement_version` `mempool-box-first-seen-v1` (`METHODOLOGY.md`, "The Quicknode VPC source"). |
 | `coverage_count_scope` | string | `rolling-window` for coverage counts. |
 | `health_count_scope` | string | `run-lifetime` for cumulative health counters. |
 

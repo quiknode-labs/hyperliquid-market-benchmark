@@ -29,6 +29,15 @@ pub const FILLS_VPC_PROVIDERS: [Provider; 3] = [
 ];
 pub const FILLS_VPC_COHORT: &str = "hyperliquid-ws+quicknode-grpc+quicknode-vpc";
 pub const MEMPOOL_PROVIDERS: [Provider; 1] = [Provider::QuickNodeGrpc];
+/// Mempool with the Quicknode VPC source: the collector on the VPC box reads the co-located sentry's
+/// `bundle` lines beside the Quicknode gRPC mempool stream; both legs share one reference per bundle
+/// (the box's first sight of it), so the endpoint and the box are one exact cohort per tx hash.
+pub const MEMPOOL_VPC_PROVIDERS: [Provider; 2] = [Provider::QuickNodeGrpc, Provider::QuickNodeVpc];
+pub const MEMPOOL_VPC_COHORT: &str = "quicknode-grpc+quicknode-vpc";
+/// Metric of the VPC mempool cohort: the box's first sight of a bundle (sentry receipt, or an
+/// earlier arrival of the same bundle at this process) → each leg's decoded, validated bundle.
+pub const MEMPOOL_VPC_METRIC_KIND: &str = "box_first_seen_to_bundle_ready";
+pub const MEMPOOL_VPC_MEASUREMENT_VERSION: &str = "mempool-box-first-seen-v1";
 pub const PEERING_PROVIDERS: [Provider; 1] = [Provider::QuickNodePeeringTcp];
 pub const HYDROMANCER_PEERING_PROVIDERS: [Provider; 1] = [Provider::HydromancerPeeringTcp];
 pub const PEERING_COMPARISON_PROVIDERS: [Provider; 2] = [

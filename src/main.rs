@@ -19,6 +19,7 @@ mod grpc;
 mod model;
 mod peering;
 mod streams;
+mod vpc_mempool;
 
 const EVENT_QUEUE_CAPACITY: usize = 16_384;
 const ROLLING_WINDOW: Duration = Duration::from_secs(300);
@@ -90,9 +91,10 @@ struct Args {
     vpc_node_data: Option<PathBuf>,
 
     /// `host:port` of the co-located Quicknode sentry's decoded stream (its LANERACER_DECODED_TCP
-    /// listener) on THIS box. Enables the `quicknode-vpc` provider for the peering dataset only:
-    /// the sentry's `block` line for each consensus round joins the cohort beside the peering
-    /// service(s) this process dials, observed by this one process with one clock. See METHODOLOGY.
+    /// listener) on THIS box. Enables the `quicknode-vpc` provider for peering (the sentry's `block`
+    /// line per round joins the cohort beside the dialed peering service(s)) and for mempool (the
+    /// sentry's `bundle` line per bundle joins the Quicknode gRPC leg, both referenced to the box's
+    /// first sight of the bundle). One process, one clock. See METHODOLOGY.
     #[arg(long, env = "VPC_DECODED_SOCKET")]
     vpc_decoded_socket: Option<String>,
 
@@ -555,7 +557,7 @@ fn validate_vpc_node_data(dataset: Dataset, path: Option<PathBuf>) -> Result<Opt
     Ok(Some(path))
 }
 
-/// The decoded stream socket is a peering-only source, and it may never be the same wire as a
+/// The decoded stream socket is a peering/mempool source, and it may never be the same wire as a
 /// dialed peering endpoint or the reference feed: one socket is scored once, under one name.
 fn validate_vpc_decoded_socket(
     dataset: Dataset,
@@ -566,9 +568,9 @@ fn validate_vpc_decoded_socket(
     let Some(socket) = socket else {
         return Ok(None);
     };
-    if dataset != Dataset::Peering {
+    if !matches!(dataset, Dataset::Peering | Dataset::Mempool) {
         anyhow::bail!(
-            "--vpc-decoded-socket (VPC_DECODED_SOCKET) is only supported for the peering dataset, not {}",
+            "--vpc-decoded-socket (VPC_DECODED_SOCKET) is only supported for the peering and mempool datasets, not {}",
             dataset.label()
         );
     }
@@ -755,6 +757,15 @@ mod tests {
                 reference
             )
             .is_err()
+        );
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Mempool,
+                Some("203.0.113.10:4011".to_owned()),
+                &[],
+                ""
+            )
+            .is_ok()
         );
         // The sentry's gossip serve and its decoded socket are different wires; the same
         // address twice would score one wire under two names.

@@ -550,7 +550,10 @@ async fn run_vpc_decoded_once(
 /// Append one newline-terminated line to `line` (without the newline). Returns `Ok(false)` at
 /// EOF. Cancel-safe: bytes already moved into `line` stay there, so a caller that drops the
 /// future mid-line and calls again continues the same line. Bounded by `MAX_DECODED_LINE`.
-async fn read_bounded_line(reader: &mut BufReader<TcpStream>, line: &mut Vec<u8>) -> Result<bool> {
+pub(crate) async fn read_bounded_line(
+    reader: &mut BufReader<TcpStream>,
+    line: &mut Vec<u8>,
+) -> Result<bool> {
     loop {
         let (found, consumed) = {
             let available = reader

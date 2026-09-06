@@ -57,9 +57,10 @@ pub struct StreamConfig {
     /// `quicknode-vpc` provider: the same per-user fill pairs the Quicknode gRPC feed carries,
     /// reconstructed with the same rule, stamped when the line becomes readable here.
     pub vpc_node_data: Option<std::path::PathBuf>,
-    /// `host:port` of the co-located Quicknode sentry's decoded stream on THIS box. When set for
-    /// the peering dataset, each `block` line the sentry writes is scored as the `quicknode-vpc`
-    /// provider in the same per-round cohort as the dialed peering service(s).
+    /// `host:port` of the co-located Quicknode sentry's decoded stream on THIS box. Peering: each
+    /// `block` line is scored as the `quicknode-vpc` provider in the same per-round cohort as the
+    /// dialed peering service(s). Mempool: each `bundle` line is the `quicknode-vpc` leg and the
+    /// Quicknode gRPC leg is re-referenced to the box's first sight of the same bundle.
     pub vpc_decoded_socket: Option<String>,
 }
 
@@ -87,6 +88,24 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
                 sender.clone(),
             )));
         }
+        let mempool_join = match (config.dataset, &config.vpc_decoded_socket) {
+            (Dataset::Mempool, Some(socket)) => {
+                let (join_tx, join_rx) = mpsc::channel(crate::vpc_mempool::JOIN_QUEUE);
+                tasks.push(tokio::spawn(crate::vpc_mempool::run_join(
+                    join_rx,
+                    coin.clone(),
+                    sender.clone(),
+                )));
+                tasks.push(tokio::spawn(crate::vpc_mempool::run_bundle_lines(
+                    socket.clone(),
+                    coin.clone(),
+                    sender.clone(),
+                    join_tx.clone(),
+                )));
+                Some(join_tx)
+            }
+            _ => None,
+        };
         if config
             .dataset
             .providers()
@@ -98,6 +117,7 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
                 coin.clone(),
                 config.dataset,
                 sender.clone(),
+                mempool_join,
             )));
         }
         if let (Dataset::Fills, Some(dir)) = (config.dataset, &config.vpc_node_data) {
@@ -205,13 +225,23 @@ async fn run_quicknode(
     coin: String,
     dataset: Dataset,
     sender: ProbeSender,
+    mempool_join: Option<mpsc::Sender<crate::vpc_mempool::JoinInput>>,
 ) {
     let mut backoff = ReconnectBackoff::default();
     loop {
         let generation = sender
             .stream_snapshot(Provider::QuickNodeGrpc, &coin)
             .connection_generation;
-        match run_quicknode_once(&endpoint, &token, &coin, dataset, &sender).await {
+        match run_quicknode_once(
+            &endpoint,
+            &token,
+            &coin,
+            dataset,
+            &sender,
+            mempool_join.as_ref(),
+        )
+        .await
+        {
             Ok(()) => warn!(%coin, dataset = dataset.label(), "Quicknode gRPC stream ended"),
             Err(error) => {
                 warn!(%coin, dataset = dataset.label(), ?error, "Quicknode gRPC stream disconnected")
@@ -518,6 +548,7 @@ async fn run_quicknode_once(
     coin: &str,
     dataset: Dataset,
     sender: &ProbeSender,
+    mempool_join: Option<&mpsc::Sender<crate::vpc_mempool::JoinInput>>,
 ) -> Result<()> {
     let channel = grpc_channel(endpoint).await?;
     let mut client = OrderBookStreamingClient::new(channel.clone())
@@ -705,6 +736,24 @@ async fn run_quicknode_once(
                         let received_wall_ms = now_ms();
                         for key in events {
                             if key.coin != coin {
+                                continue;
+                            }
+                            // On the VPC box the mempool leg is scored against the box's first
+                            // sight of the bundle, so it goes through the join instead.
+                            if let (Some(join), ContentKey::Mempool { tx_hash }) =
+                                (mempool_join, &key.content)
+                            {
+                                if join
+                                    .send(crate::vpc_mempool::JoinInput::Grpc {
+                                        tx_hash: tx_hash.clone(),
+                                        received,
+                                        received_wall_ms,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
                                 continue;
                             }
                             if !sender
@@ -1346,14 +1395,17 @@ fn parse_quicknode_mempool_bundle(payload: &str, coin: &str) -> Option<EventKey>
     })
 }
 
-fn mempool_asset_id(coin: &str) -> Option<u64> {
+pub(crate) fn mempool_asset_id(coin: &str) -> Option<u64> {
     match coin {
         "BTC" => Some(0),
         _ => None,
     }
 }
 
-fn mempool_action_matches_asset(action: Option<&serde_json::Value>, expected: u64) -> bool {
+pub(crate) fn mempool_action_matches_asset(
+    action: Option<&serde_json::Value>,
+    expected: u64,
+) -> bool {
     let Some(action) = action else {
         return false;
     };
@@ -1405,7 +1457,7 @@ fn mempool_direct_asset_matches(value: Option<&serde_json::Value>, expected: u64
         })
 }
 
-fn valid_mempool_tx_hash(tx_hash: &str) -> bool {
+pub(crate) fn valid_mempool_tx_hash(tx_hash: &str) -> bool {
     tx_hash.strip_prefix("0x").is_some_and(|hex| {
         !hex.is_empty() && hex.len() <= 128 && hex.bytes().all(|b| b.is_ascii_hexdigit())
     })

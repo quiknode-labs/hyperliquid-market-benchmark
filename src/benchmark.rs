@@ -7,8 +7,10 @@ use serde::Serialize;
 use crate::axiom::IngestHealthSnapshot;
 use crate::clock::ClockHealthSnapshot;
 use crate::model::{
-    BaseKey, ContentKey, Dataset, EventKey, FILLS_VPC_COHORT, FILLS_VPC_PROVIDERS, MarketEvent,
-    PROVIDERS, PeeringMode, ProbeEvent, Provider, RuntimeSignals,
+    BaseKey, ContentKey, Dataset, EventKey, FILLS_VPC_COHORT, FILLS_VPC_PROVIDERS,
+    MEMPOOL_VPC_COHORT, MEMPOOL_VPC_MEASUREMENT_VERSION, MEMPOOL_VPC_METRIC_KIND,
+    MEMPOOL_VPC_PROVIDERS, MarketEvent, PROVIDERS, PeeringMode, ProbeEvent, Provider,
+    RuntimeSignals,
 };
 
 #[cfg(test)]
@@ -70,8 +72,9 @@ pub struct BenchmarkConfig {
     /// by every other dataset, which keeps its static provider set.
     pub peering_mode: PeeringMode,
     /// The collector runs on a Quicknode VPC box and reads a local surface of the product as the
-    /// `quicknode-vpc` provider: the node's own fills output (fills) or the co-located sentry's
-    /// decoded stream socket (peering). Widens that dataset's cohort by one source.
+    /// `quicknode-vpc` provider: the node's own fills output (fills), the co-located sentry's
+    /// decoded `block` lines (peering) or its `bundle` lines (mempool). Widens that dataset's
+    /// cohort by one source; for mempool it also changes the reference (see `metric_kind`).
     pub vpc_local: bool,
 }
 
@@ -115,7 +118,25 @@ impl BenchmarkConfig {
             Dataset::Peering if self.vpc_local => self.peering_mode.vpc_providers(),
             Dataset::Peering => self.peering_mode.providers(),
             Dataset::Fills if self.vpc_local => &FILLS_VPC_PROVIDERS,
+            Dataset::Mempool if self.vpc_local => &MEMPOOL_VPC_PROVIDERS,
             _ => self.dataset.providers(),
+        }
+    }
+
+    /// Mempool on the VPC box measures from the box's first sight of a bundle rather than from the
+    /// embedded first-seen timestamp of one node, so its rows carry their own metric kind and
+    /// measurement version. Every other dataset keeps its static names.
+    pub fn metric_kind(&self) -> &'static str {
+        match self.dataset {
+            Dataset::Mempool if self.vpc_local => MEMPOOL_VPC_METRIC_KIND,
+            _ => self.dataset.metric_kind(),
+        }
+    }
+
+    pub fn measurement_version(&self) -> &'static str {
+        match self.dataset {
+            Dataset::Mempool if self.vpc_local => MEMPOOL_VPC_MEASUREMENT_VERSION,
+            _ => self.dataset.measurement_version(),
         }
     }
 
@@ -124,6 +145,7 @@ impl BenchmarkConfig {
             Dataset::Peering if self.vpc_local => self.peering_mode.vpc_cohort(),
             Dataset::Peering => self.peering_mode.cohort(),
             Dataset::Fills if self.vpc_local => FILLS_VPC_COHORT,
+            Dataset::Mempool if self.vpc_local => MEMPOOL_VPC_COHORT,
             _ => self.dataset.cohort(),
         }
     }
@@ -137,8 +159,8 @@ impl BenchmarkConfig {
 
     pub fn has_provider_comparison(&self) -> bool {
         match self.dataset {
-            // The VPC leg always makes a peering cohort at least two sources wide.
-            Dataset::Peering if self.vpc_local => true,
+            // The VPC leg always makes a peering or mempool cohort at least two sources wide.
+            Dataset::Peering | Dataset::Mempool if self.vpc_local => true,
             Dataset::Peering => self.peering_mode.has_provider_comparison(),
             _ => self.dataset.has_provider_comparison(),
         }
@@ -151,7 +173,7 @@ impl BenchmarkConfig {
     /// delivers it is scored as missing rather than silently dropping the
     /// round. This is what keeps a two-service peering cohort symmetric.
     fn canonical_by_any_arrival(&self) -> bool {
-        self.dataset == Dataset::Peering
+        self.dataset == Dataset::Peering || (self.dataset == Dataset::Mempool && self.vpc_local)
     }
 }
 
@@ -645,9 +667,9 @@ impl Benchmark {
                     time: window_end.clone(),
                     schema: self.config.dataset.schema(),
                     event_type: EVENT_TYPE,
-                    metric_kind: self.config.dataset.metric_kind(),
+                    metric_kind: self.config.metric_kind(),
                     benchmark_version: env!("CARGO_PKG_VERSION"),
-                    measurement_version: self.config.dataset.measurement_version(),
+                    measurement_version: self.config.measurement_version(),
                     source_commit: SOURCE_COMMIT,
                     artifact_sha256: self.config.artifact_sha256.clone(),
                     event_id: format!(
@@ -2850,7 +2872,22 @@ mod tests {
             "test-run".to_owned(),
         );
         mempool.vpc_local = true;
-        assert_eq!(mempool.providers(), &[Provider::QuickNodeGrpc]);
+        assert_eq!(
+            mempool.providers(),
+            &[Provider::QuickNodeGrpc, Provider::QuickNodeVpc]
+        );
+        assert_eq!(mempool.cohort(), "quicknode-grpc+quicknode-vpc");
+        assert!(mempool.has_provider_comparison());
+        assert!(mempool.canonical_by_any_arrival());
+        assert_eq!(mempool.metric_kind(), "box_first_seen_to_bundle_ready");
+        assert_eq!(mempool.measurement_version(), "mempool-box-first-seen-v1");
+        // Off the box the mempool contract is untouched.
+        mempool.vpc_local = false;
+        assert_eq!(mempool.metric_kind(), "mempool_first_seen_to_bundle_ready");
+        assert_eq!(mempool.measurement_version(), "mempool-bundle-ready-v1");
+        assert!(!mempool.has_provider_comparison());
+        // Fills on the box keeps its metric names: only the cohort widens.
+        assert_eq!(config.metric_kind(), "event_to_canonical_trade_ready");
     }
 
     #[test]
