@@ -842,14 +842,18 @@ fn parse_reference_time_ms(text: &str) -> Option<u64> {
     u64::try_from(ms).ok()
 }
 
+/// A 32-byte value written as hex, with or without `0x`. The node prints signature values
+/// without leading zeros (a `r` starting with a zero byte is 62 or 63 digits, one bundle in
+/// sixteen), so short input is left-padded; anything longer than 64 digits is not a 32-byte value.
 fn parse_hex32(text: &str) -> Option<[u8; 32]> {
     let hex = text.strip_prefix("0x").unwrap_or(text);
-    if hex.len() != 64 {
+    if hex.is_empty() || hex.len() > 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
+    let padded = format!("{hex:0>64}");
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        *byte = u8::from_str_radix(&padded[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
 }
@@ -937,6 +941,37 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn reference_hex_without_leading_zeros_still_names_the_32_byte_value() {
+        let full = format!("0x00{}", "ab".repeat(31));
+        let short = format!("0x{}", "ab".repeat(31));
+        assert_eq!(parse_hex32(&full), parse_hex32(&short));
+        assert_eq!(parse_hex32(&full).unwrap()[0], 0);
+        assert_eq!(parse_hex32("0x1").unwrap()[31], 1);
+        assert!(parse_hex32("").is_none());
+        assert!(parse_hex32(&format!("0x{}", "ab".repeat(33))).is_none());
+        assert!(parse_hex32("0xzz").is_none());
+        // A round whose bundle signature the feed printed short must complete like any other.
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut sig = [0x66; 32];
+        sig[0] = 0x00;
+        assembly.track_reference(ReferenceLine {
+            r: 1_000_400,
+            t: "2026-08-10T14:43:15.093322286".to_owned(),
+            b: vec![(
+                format!("0x{}", "cd".repeat(32)),
+                Some(format!("0x{}", "66".repeat(31))),
+                1,
+            )],
+        });
+        let t0 = Instant::now();
+        let mut buf = lz4_frame(&ordering_payload(1_000_400, &[[0xcd; 32]]));
+        buf.extend_from_slice(&lz4_frame(&bundle_payload(&[&record_with_sig(sig)])));
+        consume_frames(&mut buf, &mut assembly, t0, 1).unwrap();
+        let (ready, gaps) = assembly.drain_ready(t0);
+        assert_eq!((ready.len(), gaps), (1, 0));
     }
 
     #[test]
