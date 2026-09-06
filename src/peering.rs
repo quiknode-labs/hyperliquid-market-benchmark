@@ -19,6 +19,8 @@
 //! Wire protocol (Hyperliquid gossip, network-public):
 //!   frame:    [u32 BE body_len][u8 kind][body]
 //!   kind 1:   body = [u32 LE uncompressed_size][raw LZ4 block]
+//!   kind 0:   control, except a body whose first byte is 0x01: a small transaction
+//!             bundle sent uncompressed (the body IS the payload below)
 //!   payload[0] == 0x00 -> block/ordering data (round + referenced bundle list)
 //!   payload[0] == 0x01 -> transaction bundle (length-indexed signed records)
 
@@ -622,27 +624,41 @@ fn consume_frames(
         }
         let kind = buf[offset + 4];
         let body = &buf[offset + 5..offset + total];
-        if kind == 0x01
-            && let Some(payload) = decompress_data_frame(body)
-        {
-            match payload.first() {
-                Some(0x00) => {
-                    for (round, _refs) in ordering_records(&payload, assembly.max_ref_round) {
-                        assembly.track_ordering(round, arrival, wall_ms);
-                    }
+        match kind {
+            0x01 => {
+                if let Some(payload) = decompress_data_frame(body) {
+                    track_payload(&payload, assembly, arrival, wall_ms);
                 }
-                Some(0x01) => {
-                    if let Some(sig) = bundle_first_sig(&payload) {
-                        assembly.track_bundle(sig, arrival, wall_ms);
-                    }
-                }
-                _ => {}
             }
+            // Small bundles travel uncompressed as kind-0 frames whose body is the bundle
+            // payload itself (about 5 % of bundles on mainnet). A round that references one
+            // can only complete if they count; ignoring them made every such round a gap.
+            0x00 if body.first() == Some(&0x01) => {
+                track_payload(body, assembly, arrival, wall_ms);
+            }
+            _ => {}
         }
         offset += total;
     }
     buf.drain(..offset);
     Ok(())
+}
+
+/// One decoded gossip payload: an ordering record set (0x00) or a transaction bundle (0x01).
+fn track_payload(payload: &[u8], assembly: &mut Assembly, arrival: Instant, wall_ms: u64) {
+    match payload.first() {
+        Some(0x00) => {
+            for (round, _refs) in ordering_records(payload, assembly.max_ref_round) {
+                assembly.track_ordering(round, arrival, wall_ms);
+            }
+        }
+        Some(0x01) => {
+            if let Some(sig) = bundle_first_sig(payload) {
+                assembly.track_bundle(sig, arrival, wall_ms);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// kind=0x01 body: [u32 LE uncompressed_size][raw LZ4 block].
@@ -924,6 +940,36 @@ mod tests {
     }
 
     #[test]
+    fn an_uncompressed_kind0_bundle_frame_completes_its_round() {
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let sig = [0x55; 32];
+        assembly.track_reference(reference_line(
+            1_000_300,
+            "2026-08-10T14:43:15.093322286",
+            &[sig],
+        ));
+        let t0 = Instant::now();
+        let mut buf = lz4_frame(&ordering_payload(1_000_300, &[[0xab; 32]]));
+        // The bundle arrives as a kind-0 frame whose body is the raw bundle payload.
+        let raw = bundle_payload(&[&record_with_sig(sig)]);
+        buf.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+        buf.push(0x00);
+        buf.extend_from_slice(&raw);
+        // A kind-0 control frame (body not starting 0x01) is still ignored.
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x00, 0x03]);
+        consume_frames(&mut buf, &mut assembly, t0, 7).unwrap();
+        assert!(buf.is_empty());
+        let (ready, gaps) = assembly.drain_ready(t0);
+        assert_eq!(gaps, 0);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            ready[0].key.content,
+            ContentKey::Peering { round: 1_000_300 }
+        );
+        assert_eq!(ready[0].received_wall_ms, 7);
+    }
+
+    #[test]
     fn block_ready_boundary_is_the_last_required_arrival() {
         let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
         let sig_a = [0x11; 32];
@@ -1053,7 +1099,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod decoded_tests {
     use super::*;
@@ -1117,14 +1162,23 @@ mod decoded_tests {
         assert_eq!(ready[0].received_wall_ms, 1_080);
         // One sample per round; a re-served line never produces a second one.
         assembly.track_line(block_line("block", 500, true, &[0x11]), t0, 1_000);
-        assert!(assembly.drain_ready(t0 + Duration::from_secs(1)).0.is_empty());
+        assert!(
+            assembly
+                .drain_ready(t0 + Duration::from_secs(1))
+                .0
+                .is_empty()
+        );
     }
 
     #[test]
     fn bundle_order_does_not_matter_but_the_set_must_match() {
         let mut assembly = DecodedAssembly::new("BLOCKS".to_owned());
         let t0 = Instant::now();
-        assembly.track_reference(reference(600, "2026-08-10T14:43:15.093322286", &[0x11, 0x22]));
+        assembly.track_reference(reference(
+            600,
+            "2026-08-10T14:43:15.093322286",
+            &[0x11, 0x22],
+        ));
         assembly.track_reference(reference(601, "2026-08-10T14:43:15.160000000", &[0x33]));
         assembly.track_line(block_line("block", 600, true, &[0x22, 0x11]), t0, 1);
         assembly.track_line(block_line("block", 601, true, &[0x44]), t0, 2);
@@ -1144,7 +1198,12 @@ mod decoded_tests {
         assembly.track_reference(reference(701, "2026-08-10T14:43:15.160000000", &[0x22]));
         assembly.track_line(block_line("block", 700, false, &[]), t0, 1);
         assembly.track_line(block_line("block", 701, false, &[]), t0, 1);
-        assert!(assembly.drain_ready(t0 + Duration::from_secs(1)).0.is_empty());
+        assert!(
+            assembly
+                .drain_ready(t0 + Duration::from_secs(1))
+                .0
+                .is_empty()
+        );
         assembly.track_line(
             block_line("block_patch", 700, true, &[0x11]),
             t0 + Duration::from_millis(300),

@@ -169,7 +169,9 @@ canonical reference; the cohort is symmetric.
 
 A block is **ready** when its ordering record has been received and parsed
 (consensus round plus the list of referenced transaction bundles) and every
-referenced bundle has been received, decompressed, and validated. The observer
+referenced bundle has been received, decompressed where the wire compressed it
+(small bundles travel uncompressed, about 5 % of mainnet bundles, and count the
+same), and validated. The observer
 wall-clock timestamp is captured at the last required arrival, before the
 bounded event queue, so transport, framing, decompression, and validation are
 included consistently with the other datasets.
