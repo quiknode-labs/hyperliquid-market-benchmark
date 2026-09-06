@@ -338,7 +338,9 @@ def main():
     def roll_window(now):
         nonlocal window_start, window_samples, window_negatives
         nonlocal window_round_min, window_round_max
-        if window_start is not None and (window_samples or window_negatives):
+        # A window with only negative latencies (local clock ahead of the producer) has no
+        # quantiles to publish; window_row would index an empty list. Drop it, keep counting.
+        if window_start is not None and window_samples:
             sink.push([
                 window_row(
                     identity,

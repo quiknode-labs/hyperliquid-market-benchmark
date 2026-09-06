@@ -1199,8 +1199,17 @@ async fn run_vpc_fills(hourly_root: PathBuf, coin: String, sender: ProbeSender) 
     }
 }
 
-/// Newest `<root>/<date>/<hour>` file by name order (dates and hours are zero-padded).
+/// Newest `<root>/<date>/<hour>` file: dates are `YYYYMMDD` (name order is time order); hour
+/// file names are NOT zero-padded by hl-node (`0`…`23`), so they are ordered numerically, with
+/// name order only as the fallback for anything that is not a number.
 fn newest_hourly_file(root: &Path) -> Option<PathBuf> {
+    fn hour_key(path: &Path) -> (u32, String) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        (name.parse::<u32>().unwrap_or(0), name.to_owned())
+    }
     let mut days: Vec<_> = std::fs::read_dir(root)
         .ok()?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -1213,7 +1222,7 @@ fn newest_hourly_file(root: &Path) -> Option<PathBuf> {
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
             .filter(|path| path.is_file())
             .collect();
-        hours.sort();
+        hours.sort_by_key(|path| hour_key(path));
         if let Some(newest) = hours.pop() {
             return Some(newest);
         }
@@ -1916,13 +1925,24 @@ mod tests {
     fn newest_hourly_file_orders_by_date_then_hour() {
         let root = std::env::temp_dir().join(format!("vpc-fills-tail-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for (day, hour) in [("20260905", "23"), ("20260906", "07"), ("20260906", "15")] {
+        // hl-node does not zero-pad hours: "9" must lose to "15" (text order says otherwise).
+        for (day, hour) in [
+            ("20260905", "23"),
+            ("20260906", "7"),
+            ("20260906", "9"),
+            ("20260906", "15"),
+        ] {
             std::fs::create_dir_all(root.join(day)).unwrap();
             std::fs::write(root.join(day).join(hour), b"").unwrap();
         }
         assert_eq!(
             newest_hourly_file(&root),
             Some(root.join("20260906").join("15"))
+        );
+        std::fs::write(root.join("20260906").join("23"), b"").unwrap();
+        assert_eq!(
+            newest_hourly_file(&root),
+            Some(root.join("20260906").join("23"))
         );
         let _ = std::fs::remove_dir_all(&root);
     }

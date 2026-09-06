@@ -650,7 +650,7 @@ impl Benchmark {
                         self.config.dataset.schema(),
                         self.config.run_id,
                         window_id,
-                        public_provider(provider)
+                        event_id_provider(provider)
                     ),
                     window_id: window_id.clone(),
                     window_end: window_end.clone(),
@@ -1262,6 +1262,17 @@ fn public_provider(provider: Provider) -> &'static str {
         Provider::QuickNodePeeringTcp => "quicknode",
         Provider::HydromancerPeeringTcp => "hydromancer",
         Provider::QuickNodeVpc => "quicknode",
+    }
+}
+
+/// The provider component of `event_id`. Historically the public provider company, which is
+/// unique per window everywhere except on the VPC box, where two Quicknode paths (gRPC and the
+/// box's own node) publish in one window; the VPC path takes its source name so the two rows
+/// never share an identity. Existing providers keep their ids byte-for-byte.
+fn event_id_provider(provider: Provider) -> &'static str {
+    match provider {
+        Provider::QuickNodeVpc => public_source(provider),
+        other => public_provider(other),
     }
 }
 
@@ -2835,5 +2846,18 @@ mod tests {
         );
         mempool.vpc_local = true;
         assert_eq!(mempool.providers(), &[Provider::QuickNodeGrpc]);
+    }
+    #[test]
+    fn vpc_and_grpc_rows_in_one_window_have_distinct_event_ids() {
+        assert_eq!(event_id_provider(Provider::QuickNodeGrpc), "quicknode");
+        assert_eq!(
+            event_id_provider(Provider::QuickNodePeeringTcp),
+            "quicknode"
+        );
+        assert_eq!(event_id_provider(Provider::QuickNodeVpc), "quicknode-vpc");
+        assert_ne!(
+            event_id_provider(Provider::QuickNodeGrpc),
+            event_id_provider(Provider::QuickNodeVpc)
+        );
     }
 }
