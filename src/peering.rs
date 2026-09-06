@@ -162,7 +162,13 @@ impl Assembly {
                     .is_some_and(|seen| now.duration_since(seen) > INCOMPLETE_DEADLINE)
                 {
                     tracked.reported_gap = true;
-                    expired_gaps += 1;
+                    // A round the reference feed never named is not a block the service failed
+                    // to deliver: the ordering scan also matches round-shaped bytes inside the
+                    // frame's quorum material (rounds the chain never produced). Only a round the
+                    // chain produced and the wire did not complete is a gap.
+                    if tracked.reference.is_some() {
+                        expired_gaps += 1;
+                    }
                 }
                 continue;
             };
@@ -941,6 +947,32 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn only_rounds_the_chain_produced_can_expire_as_gaps() {
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let t0 = Instant::now();
+        assembly.track_reference(reference_line(
+            2_000_000,
+            "2026-08-10T14:43:15.093322286",
+            &[[0x11; 32]],
+        ));
+        // A round-shaped byte pattern in quorum material: an ordering the reference never names.
+        assembly.track_ordering(2_000_900, t0, 1);
+        // A real round the reference names but the wire never completes.
+        assembly.track_reference(reference_line(
+            2_000_001,
+            "2026-08-10T14:43:15.160000000",
+            &[[0x22; 32]],
+        ));
+        let (ready, gaps) = assembly.drain_ready(t0 + Duration::from_secs(6));
+        assert!(ready.is_empty());
+        assert_eq!(
+            gaps, 2,
+            "2_000_000 and 2_000_001 never completed; 2_000_900 was never a block"
+        );
+        assert_eq!(assembly.drain_ready(t0 + Duration::from_secs(7)).1, 0);
     }
 
     #[test]
