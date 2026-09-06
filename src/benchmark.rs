@@ -7,8 +7,8 @@ use serde::Serialize;
 use crate::axiom::IngestHealthSnapshot;
 use crate::clock::ClockHealthSnapshot;
 use crate::model::{
-    BaseKey, ContentKey, Dataset, EventKey, MarketEvent, PROVIDERS, PeeringMode, ProbeEvent,
-    Provider, RuntimeSignals,
+    BaseKey, ContentKey, Dataset, EventKey, FILLS_VPC_COHORT, FILLS_VPC_PROVIDERS, MarketEvent,
+    PROVIDERS, PeeringMode, ProbeEvent, Provider, RuntimeSignals,
 };
 
 #[cfg(test)]
@@ -69,6 +69,9 @@ pub struct BenchmarkConfig {
     /// Which peering service(s) the peering dataset dials and stamps. Ignored
     /// by every other dataset, which keeps its static provider set.
     pub peering_mode: PeeringMode,
+    /// The collector runs on a Quicknode VPC box and reads that box's node output as the
+    /// `quicknode-vpc` provider (fills today). Widens the fills cohort to three sources.
+    pub vpc_local: bool,
 }
 
 impl BenchmarkConfig {
@@ -100,6 +103,7 @@ impl BenchmarkConfig {
             max_settled,
             max_rolling_cohorts,
             peering_mode: PeeringMode::Quicknode,
+            vpc_local: false,
         }
     }
 }
@@ -108,6 +112,7 @@ impl BenchmarkConfig {
     pub fn providers(&self) -> &'static [Provider] {
         match self.dataset {
             Dataset::Peering => self.peering_mode.providers(),
+            Dataset::Fills if self.vpc_local => &FILLS_VPC_PROVIDERS,
             _ => self.dataset.providers(),
         }
     }
@@ -115,6 +120,7 @@ impl BenchmarkConfig {
     pub fn cohort(&self) -> &'static str {
         match self.dataset {
             Dataset::Peering => self.peering_mode.cohort(),
+            Dataset::Fills if self.vpc_local => FILLS_VPC_COHORT,
             _ => self.dataset.cohort(),
         }
     }
@@ -307,9 +313,13 @@ pub struct LatencyWindowEvent {
     pub outcome_foundation_strict_fastest_count: u64,
     pub outcome_hydromancer_strict_fastest_count: u64,
     pub outcome_quicknode_strict_fastest_count: u64,
+    /// The VPC box's own node is a distinct path from the Quicknode gRPC feed inside one
+    /// cohort, so it is scored as its own column rather than folded into the Quicknode family.
+    pub outcome_quicknode_vpc_strict_fastest_count: u64,
     pub outcome_foundation_tied_fastest_count: u64,
     pub outcome_hydromancer_tied_fastest_count: u64,
     pub outcome_quicknode_tied_fastest_count: u64,
+    pub outcome_quicknode_vpc_tied_fastest_count: u64,
     pub outcome_tie_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p50_ms: Option<f64>,
@@ -694,6 +704,8 @@ impl Benchmark {
                         &outcomes.strict_fastest,
                         QUICKNODE_FAMILY,
                     ),
+                    outcome_quicknode_vpc_strict_fastest_count: outcomes.strict_fastest
+                        [Provider::QuickNodeVpc.index()],
                     outcome_foundation_tied_fastest_count: outcomes.tied_fastest
                         [Provider::FoundationWs.index()],
                     outcome_hydromancer_tied_fastest_count: provider_family_total(
@@ -704,6 +716,8 @@ impl Benchmark {
                         &outcomes.tied_fastest,
                         QUICKNODE_FAMILY,
                     ),
+                    outcome_quicknode_vpc_tied_fastest_count: outcomes.tied_fastest
+                        [Provider::QuickNodeVpc.index()],
                     outcome_tie_count: outcomes.ties,
                     p50_ms: summary.map(|value| value.p50),
                     p95_ms: summary.map(|value| value.p95),
@@ -1247,6 +1261,7 @@ fn public_provider(provider: Provider) -> &'static str {
         Provider::QuickNodeGrpc => "quicknode",
         Provider::QuickNodePeeringTcp => "quicknode",
         Provider::HydromancerPeeringTcp => "hydromancer",
+        Provider::QuickNodeVpc => "quicknode",
     }
 }
 
@@ -1257,6 +1272,7 @@ fn public_source(provider: Provider) -> &'static str {
         Provider::QuickNodeGrpc => "quicknode-grpc",
         Provider::QuickNodePeeringTcp => "quicknode-peering",
         Provider::HydromancerPeeringTcp => "hydromancer-peering",
+        Provider::QuickNodeVpc => "quicknode-vpc",
     }
 }
 
@@ -1600,7 +1616,7 @@ mod tests {
 
             let ring = &benchmark.windows["BTC"].cohorts;
             assert_eq!(ring.len(), 1);
-            assert_eq!(ring[0].latency_ms, [200, 300, 100, 0, 0]);
+            assert_eq!(ring[0].latency_ms, [200, 300, 100, 0, 0, 0]);
             for provider in BOOK_PROVIDERS {
                 assert_eq!(benchmark.counters["BTC"][provider.index()].matched, 1);
             }
@@ -1642,7 +1658,7 @@ mod tests {
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BTC"].cohorts[0].latency_ms,
-            [200, 0, 100, 0, 0]
+            [200, 0, 100, 0, 0, 0]
         );
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| {
@@ -1688,7 +1704,7 @@ mod tests {
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BTC"].cohorts[0].latency_ms,
-            [0, 0, 125, 0, 0]
+            [0, 0, 125, 0, 0, 0]
         );
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1758,7 +1774,7 @@ mod tests {
         assert_eq!(benchmark.windows["BLOCKS"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BLOCKS"].cohorts[0].latency_ms,
-            [0, 0, 0, 150, 0]
+            [0, 0, 0, 150, 0, 0]
         );
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2026,7 +2042,7 @@ mod tests {
         for benchmark in [&late_then_early, &early_then_late] {
             let window = &benchmark.windows["BTC"];
             assert_eq!(window.cohorts.len(), 1);
-            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100, 0, 0]);
+            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100, 0, 0, 0]);
             assert_eq!(window.complete_cohorts, 1);
             assert_eq!(window.state_evictions, 0);
             assert_eq!(window.rolling_evictions, 0);
@@ -2778,5 +2794,46 @@ mod tests {
                 .filter(|event| event.coin == "ETH")
                 .all(|event| event.window_id == "runner:bbo:ETH:30000")
         );
+    }
+    #[test]
+    fn vpc_local_widens_the_fills_cohort_to_three_sources_and_nothing_else() {
+        let mut config = BenchmarkConfig::production(
+            Dataset::Fills,
+            vec!["BTC".to_owned()],
+            "teraswitch".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "teraswitch-nrt-01".to_owned(),
+            "test-run".to_owned(),
+        );
+        assert_eq!(
+            config.providers(),
+            &[Provider::FoundationWs, Provider::QuickNodeGrpc]
+        );
+        config.vpc_local = true;
+        assert_eq!(
+            config.providers(),
+            &[
+                Provider::FoundationWs,
+                Provider::QuickNodeGrpc,
+                Provider::QuickNodeVpc
+            ]
+        );
+        assert_eq!(
+            config.cohort(),
+            "hyperliquid-ws+quicknode-grpc+quicknode-vpc"
+        );
+        assert_eq!(config.reference_provider(), Provider::FoundationWs);
+        let mut mempool = BenchmarkConfig::production(
+            Dataset::Mempool,
+            vec!["BTC".to_owned()],
+            "teraswitch".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "teraswitch-nrt-01".to_owned(),
+            "test-run".to_owned(),
+        );
+        mempool.vpc_local = true;
+        assert_eq!(mempool.providers(), &[Provider::QuickNodeGrpc]);
     }
 }

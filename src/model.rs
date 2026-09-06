@@ -6,12 +6,13 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use clap::ValueEnum;
 use tokio::sync::mpsc;
 
-pub const PROVIDERS: [Provider; 5] = [
+pub const PROVIDERS: [Provider; 6] = [
     Provider::FoundationWs,
     Provider::HydromancerWs,
     Provider::QuickNodeGrpc,
     Provider::QuickNodePeeringTcp,
     Provider::HydromancerPeeringTcp,
+    Provider::QuickNodeVpc,
 ];
 pub const BOOK_PROVIDERS: [Provider; 3] = [
     Provider::FoundationWs,
@@ -19,6 +20,14 @@ pub const BOOK_PROVIDERS: [Provider; 3] = [
     Provider::QuickNodeGrpc,
 ];
 pub const FILLS_PROVIDERS: [Provider; 2] = [Provider::FoundationWs, Provider::QuickNodeGrpc];
+/// Fills with the Quicknode VPC source: the collector runs on the VPC box and reads that box's own
+/// node output beside the two network feeds, so all three are one exact cohort on one clock.
+pub const FILLS_VPC_PROVIDERS: [Provider; 3] = [
+    Provider::FoundationWs,
+    Provider::QuickNodeGrpc,
+    Provider::QuickNodeVpc,
+];
+pub const FILLS_VPC_COHORT: &str = "hyperliquid-ws+quicknode-grpc+quicknode-vpc";
 pub const MEMPOOL_PROVIDERS: [Provider; 1] = [Provider::QuickNodeGrpc];
 pub const PEERING_PROVIDERS: [Provider; 1] = [Provider::QuickNodePeeringTcp];
 pub const HYDROMANCER_PEERING_PROVIDERS: [Provider; 1] = [Provider::HydromancerPeeringTcp];
@@ -165,6 +174,10 @@ pub enum Provider {
     QuickNodeGrpc,
     QuickNodePeeringTcp,
     HydromancerPeeringTcp,
+    /// The Quicknode VPC product read on the box that runs it: a Hyperliquid node fed by a
+    /// co-located Quicknode sentry, observed through the node's own output files. Only a collector
+    /// running on that box can stamp this provider; it never appears from a network observer.
+    QuickNodeVpc,
 }
 
 impl Provider {
@@ -175,6 +188,7 @@ impl Provider {
             Self::QuickNodeGrpc => 2,
             Self::QuickNodePeeringTcp => 3,
             Self::HydromancerPeeringTcp => 4,
+            Self::QuickNodeVpc => 5,
         }
     }
 
@@ -185,6 +199,7 @@ impl Provider {
             Self::QuickNodeGrpc => "quicknode-grpc",
             Self::QuickNodePeeringTcp => "quicknode-peering",
             Self::HydromancerPeeringTcp => "hydromancer-peering",
+            Self::QuickNodeVpc => "quicknode-vpc",
         }
     }
 
@@ -193,6 +208,7 @@ impl Provider {
             Self::FoundationWs | Self::HydromancerWs => "ws",
             Self::QuickNodeGrpc => "grpc",
             Self::QuickNodePeeringTcp | Self::HydromancerPeeringTcp => "tcp",
+            Self::QuickNodeVpc => "local",
         }
     }
 }

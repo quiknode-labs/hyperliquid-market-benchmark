@@ -28,7 +28,7 @@ const COHORT_TIMEOUT: Duration = Duration::from_secs(5);
 const COHORT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 const STALE_AFTER: Duration = Duration::from_secs(60);
 const MAX_COINS_PER_PROCESS: usize = 10;
-const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle"];
+const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle", "teraswitch"];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -82,6 +82,12 @@ struct Args {
     /// reproducible from any Hyperliquid node's replay output; see METHODOLOGY.
     #[arg(long, env = "PEERING_REFERENCE_FEED")]
     peering_reference: Option<String>,
+
+    /// `hl/data` of the Hyperliquid node running on THIS box. Enables the `quicknode-vpc`
+    /// provider (fills dataset only today): the box's own node output joins the cohort beside
+    /// the network feeds, observed by this one process with one clock. See METHODOLOGY.
+    #[arg(long, env = "VPC_NODE_DATA")]
+    vpc_node_data: Option<PathBuf>,
 
     /// Cloud measurement location. Inferred from the public runner ID when absent.
     #[arg(long, env = "BENCHMARK_CLOUD")]
@@ -271,6 +277,8 @@ async fn main() -> Result<()> {
     config.stale_after = STALE_AFTER;
     config.artifact_sha256 = artifact_sha256;
     config.peering_mode = peering_mode;
+    let vpc_node_data = validate_vpc_node_data(args.dataset, args.vpc_node_data.clone())?;
+    config.vpc_local = vpc_node_data.is_some();
     let mut benchmark = Benchmark::new(config, now, wall_now);
 
     let signals = Arc::new(RuntimeSignals::new(&coins));
@@ -287,6 +295,7 @@ async fn main() -> Result<()> {
             quicknode_token,
             peering_endpoints,
             peering_reference,
+            vpc_node_data,
         },
         sender,
     );
@@ -511,6 +520,27 @@ fn required_secret(name: &str) -> Result<String> {
         .with_context(|| format!("{name} is required"))
 }
 
+/// `--vpc-node-data` is accepted only where the source exists (fills), and must point at a node
+/// data directory that already writes `node_fills_by_block`, so a misconfigured box fails at
+/// start instead of publishing a cohort that can never complete.
+fn validate_vpc_node_data(dataset: Dataset, path: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(path) = path else { return Ok(None) };
+    if dataset != Dataset::Fills {
+        anyhow::bail!(
+            "--vpc-node-data (VPC_NODE_DATA) is only supported for the fills dataset today, not {}",
+            dataset.label()
+        );
+    }
+    let fills = path.join("node_fills_by_block").join("hourly");
+    if !fills.is_dir() {
+        anyhow::bail!(
+            "--vpc-node-data {} has no node_fills_by_block/hourly directory (is this the node's hl/data?)",
+            path.display()
+        );
+    }
+    Ok(Some(path))
+}
+
 fn infer_location(runner: &str) -> (Option<String>, Option<String>, Option<String>) {
     let parts = runner
         .split(['-', '.'])
@@ -518,7 +548,7 @@ fn infer_location(runner: &str) -> (Option<String>, Option<String>, Option<Strin
         .collect::<Vec<_>>();
     let cloud = parts
         .iter()
-        .find(|part| matches!(part.as_str(), "aws" | "gcp" | "oracle"))
+        .find(|part| matches!(part.as_str(), "aws" | "gcp" | "oracle" | "teraswitch"))
         .cloned();
     let region = parts.iter().find_map(|part| match part.as_str() {
         "iad" | "fra" | "nrt" | "sin" => Some(part.clone()),
@@ -760,5 +790,32 @@ mod tests {
             .unwrap();
 
         assert!(config.max_rolling_cohorts >= required_rolling);
+    }
+    #[test]
+    fn vpc_node_data_is_fills_only_and_must_hold_a_fills_tree() {
+        let root = std::env::temp_dir().join(format!("vpc-node-data-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            validate_vpc_node_data(Dataset::Fills, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(validate_vpc_node_data(Dataset::Mempool, Some(root.clone())).is_err());
+        assert!(validate_vpc_node_data(Dataset::Fills, Some(root.clone())).is_err());
+        std::fs::create_dir_all(root.join("node_fills_by_block").join("hourly")).unwrap();
+        assert_eq!(
+            validate_vpc_node_data(Dataset::Fills, Some(root.clone())).unwrap(),
+            Some(root.clone())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(validate_public_identity("teraswitch-nrt-01", "teraswitch", "nrt", "nrt").is_ok());
+        assert_eq!(
+            infer_location("teraswitch-nrt-01"),
+            (
+                Some("teraswitch".to_owned()),
+                Some("nrt".to_owned()),
+                Some("nrt".to_owned())
+            )
+        );
     }
 }

@@ -62,6 +62,30 @@ canonical trade. This measures public trade-feed delivery. It does not measure
 customer order submission, acknowledgement, order-to-fill, or exchange
 matching-engine execution latency.
 
+## The Quicknode VPC source (fills)
+
+A Quicknode VPC box runs a Hyperliquid node fed by a co-located Quicknode sentry, and the
+customer's own client runs on that box. Its fills are measured the only honest way a
+co-located path can be: the collector itself runs on the box (`--vpc-node-data <hl/data>`),
+subscribes to Quicknode gRPC and the Foundation WebSocket over the network exactly as any
+other observer, and additionally tails the node's own `node_fills_by_block` output as the
+`quicknode-vpc` provider (`source` `quicknode-vpc`, transport `local`). One process, one
+clock, one three-source cohort per trade (`hyperliquid-ws+quicknode-grpc+quicknode-vpc`).
+
+The VPC leg reconstructs each trade from the node's two per-user fills with the rule the
+Quicknode gRPC path uses (`parse_quicknode_fill_batch`: same tid, time, coin, price, size and
+hash; the crossing fill's side is the taker side; users are buyer then seller), and it is
+ready when the line is readable and that reconstruction succeeds — the same canonical-trade
+boundary as the gRPC leg. Only lines written after the collector started are timed.
+
+What this does and does not claim: it compares three delivery paths of the same executed
+fill at one observer that happens to be the VPC box; the VPC leg's advantage is the absence
+of a network hop and of a provider pipeline, not a faster matching engine. Runner identity is
+public like every other runner (`teraswitch-nrt-01`, cloud `teraswitch`), and the
+`quicknode-vpc` provider can only be stamped by a collector on such a box, so it never
+appears from a network observer. Outcome columns for it are `outcome_quicknode_vpc_*`; it is
+not folded into the Quicknode family because both Quicknode paths are present in one cohort.
+
 ## Mempool bundle readiness
 
 Each Quicknode mempool response contains one of the production JSON shapes:

@@ -34,7 +34,7 @@ consumer must not replace an omitted value with zero.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `provider` | enum | `quicknode`, `hyperliquid`, or `hydromancer`. |
+| `provider` | enum | `quicknode`, `hyperliquid`, or `hydromancer`. The Quicknode VPC leg is `quicknode` with `source` `quicknode-vpc` and `protocol` `local`; it exists only in rows from a collector running on the VPC box (`METHODOLOGY.md`, "The Quicknode VPC source"). |
 | `protocol` | enum | `grpc` for Quicknode; `ws` for Foundation and Hydromancer. |
 | `source` | enum | `quicknode-grpc`, `hyperliquid-ws`, or `hydromancer-ws`. |
 | `dataset` | enum | `bbo`, depth-20 `l2book`, executed-trade `fills`, or filtered-bundle `mempool`. |
@@ -112,10 +112,12 @@ Mempool has no provider race. It emits `outcome_count_scope=not-applicable`,
 | `outcome_interval_duration_ms` | integer | Actual elapsed boundary span. |
 | `outcome_interval_complete` | boolean | Exact nominal duration after startup and all cohort-health gates passed. |
 | `outcome_complete_cohort_count` | integer | Complete exact cohorts committed in this interval. |
-| `outcome_quicknode_strict_fastest_count` | integer | Cohorts with Quicknode as the unique minimum absolute latency. |
+| `outcome_quicknode_strict_fastest_count` | integer | Cohorts with Quicknode (gRPC or peering, whichever the process dials) as the unique minimum absolute latency. |
+| `outcome_quicknode_vpc_strict_fastest_count` | integer | Cohorts with the Quicknode VPC leg as the unique minimum; zero unless the cohort is `hyperliquid-ws+quicknode-grpc+quicknode-vpc`. |
 | `outcome_foundation_strict_fastest_count` | integer | Cohorts with Foundation as the unique minimum. |
 | `outcome_hydromancer_strict_fastest_count` | integer | Cohorts with Hydromancer as the unique minimum. |
 | `outcome_tie_count` | integer | Cohorts whose minimum was shared by at least two paths. |
+| `outcome_quicknode_vpc_tied_fastest_count` | integer | Cohorts where the Quicknode VPC leg shared the minimum. |
 | `outcome_{source}_tied_fastest_count` | integer | For transparency, how often that active source participated in a tie. |
 
 For every valid interval:

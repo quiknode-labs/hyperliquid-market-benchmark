@@ -163,6 +163,22 @@ explicit incomplete cohort without stopping the other streams. Every
 30-second window must be durably admitted within 20 seconds; if local
 publication stalls, the process exits so its service supervisor can restart it.
 
+### The Quicknode VPC source (fills, on the VPC box)
+
+A collector running on a Quicknode VPC box (sentry + Hyperliquid node on one machine) can add
+the box's own node output to the fills cohort:
+
+```bash
+VPC_NODE_DATA=/data/hype/mainnet/hl_visor/hl/data \
+hyperliquid-market-benchmark --dataset fills --coins BTC --runner teraswitch-nrt-01
+```
+
+`--vpc-node-data` tails `node_fills_by_block` as the `quicknode-vpc` provider beside the
+Quicknode gRPC and Foundation subscriptions the same process holds, so the three paths form one
+exact cohort per trade with one clock (`docs/METHODOLOGY.md`, "The Quicknode VPC source"). It is
+refused for any other dataset and when the directory has no fills tree. The runner is public
+like every other (`cloud` `teraswitch`).
+
 ## Public observer identity
 
 Telemetry contains a stable public runner ID, cloud, logical comparison region,
