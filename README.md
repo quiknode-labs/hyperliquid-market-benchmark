@@ -165,17 +165,19 @@ publication stalls, the process exits so its service supervisor can restart it.
 
 ### The Quicknode VPC source (fills, peering and mempool, on the VPC box)
 
-A collector running on a Quicknode VPC box (sentry + Hyperliquid node on one machine) can add
-the box's own node output to the fills cohort:
+A collector running on a Quicknode VPC box (sentry + Hyperliquid node on one machine) records
+the box's own node output as the fills source:
 
 ```bash
 VPC_NODE_DATA=/data/hype/mainnet/hl_visor/hl/data \
 hyperliquid-market-benchmark --dataset fills --coins BTC --runner vpc-nrt-01
 ```
 
-`--vpc-node-data` tails `node_fills_by_block` as the `quicknode-vpc` provider beside the
-Quicknode gRPC and Foundation subscriptions the same process holds, so the three paths form one
-exact cohort per trade with one clock (`docs/METHODOLOGY.md`, "The Quicknode VPC source"). It is
+`--vpc-node-data` tails `node_fills_by_block` as the single `quicknode-vpc` source (cohort
+`quicknode-vpc`, `measurement_version` `fills-vpc-node-v1`); the process dials no network feed
+and needs no gRPC token. Each trade is timed from its own fill timestamp to canonical-fill-ready
+at the node, the same boundary the gRPC path is scored at elsewhere, so the dashboard can draw
+this leg beside any observer's cohort (`docs/METHODOLOGY.md`, "The Quicknode VPC source"). It is
 refused for any other dataset and when the directory has no fills tree. The runner is public
 like every other (`cloud` `vpc`).
 

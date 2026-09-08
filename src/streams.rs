@@ -53,9 +53,9 @@ pub struct StreamConfig {
     pub peering_endpoints: Vec<(Provider, String)>,
     pub peering_reference: String,
     /// `hl/data` of the Hyperliquid node on THIS box (the Quicknode VPC product). When set for
-    /// the fills dataset, the node's own `node_fills_by_block` output is tailed as the
-    /// `quicknode-vpc` provider: the same per-user fill pairs the Quicknode gRPC feed carries,
-    /// reconstructed with the same rule, stamped when the line becomes readable here.
+    /// the fills dataset, the node's own `node_fills_by_block` output is the only source: the
+    /// same per-user fill pairs the Quicknode gRPC feed carries, reconstructed with the same
+    /// rule, stamped when the line becomes readable here. No network feed is dialed.
     pub vpc_node_data: Option<std::path::PathBuf>,
     /// `host:port` of the co-located Quicknode sentry's decoded stream on THIS box. Peering: each
     /// `block` line is scored as the `quicknode-vpc` provider in the same per-round cohort as the
@@ -66,8 +66,9 @@ pub struct StreamConfig {
 
 pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandle<()>> {
     let mut tasks = Vec::with_capacity(config.coins.len() * config.dataset.providers().len());
+    let vpc_node_only = config.dataset == Dataset::Fills && config.vpc_node_data.is_some();
     for coin in config.coins.clone() {
-        if config.dataset.providers().contains(&Provider::FoundationWs) {
+        if config.dataset.providers().contains(&Provider::FoundationWs) && !vpc_node_only {
             tasks.push(tokio::spawn(run_foundation(
                 config.foundation_ws.clone(),
                 coin.clone(),
@@ -110,6 +111,7 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
             .dataset
             .providers()
             .contains(&Provider::QuickNodeGrpc)
+            && !vpc_node_only
         {
             tasks.push(tokio::spawn(run_quicknode(
                 config.quicknode_grpc.clone(),

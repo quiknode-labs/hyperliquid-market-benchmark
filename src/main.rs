@@ -84,9 +84,9 @@ struct Args {
     #[arg(long, env = "PEERING_REFERENCE_FEED")]
     peering_reference: Option<String>,
 
-    /// `hl/data` of the Hyperliquid node running on THIS box. Enables the `quicknode-vpc`
-    /// provider (fills dataset only today): the box's own node output joins the cohort beside
-    /// the network feeds, observed by this one process with one clock. See METHODOLOGY.
+    /// `hl/data` of the Hyperliquid node running on THIS box. Fills dataset only: the process
+    /// then dials no network feed and records the box's own node output as the single
+    /// `quicknode-vpc` source, timed from each fill's own timestamp. See METHODOLOGY.
     #[arg(long, env = "VPC_NODE_DATA")]
     vpc_node_data: Option<PathBuf>,
 
@@ -196,10 +196,14 @@ async fn main() -> Result<()> {
     } else {
         String::new()
     };
+    // Fills on the VPC box reads the node alone: no network feed, no token (METHODOLOGY, "The
+    // Quicknode VPC source").
+    let vpc_node_only = args.dataset == Dataset::Fills && args.vpc_node_data.is_some();
     let quicknode_token = if args
         .dataset
         .providers()
         .contains(&model::Provider::QuickNodeGrpc)
+        && !vpc_node_only
     {
         let token = required_secret("QUICKNODE_HYPERLIQUID_TOKEN")?;
         tonic::metadata::MetadataValue::try_from(token.as_str())
@@ -212,6 +216,7 @@ async fn main() -> Result<()> {
         .dataset
         .providers()
         .contains(&model::Provider::QuickNodeGrpc)
+        && !vpc_node_only
     {
         args.quicknode_grpc.clone().context(
             "--quicknode-grpc (QUICKNODE_HYPERLIQUID_GRPC_URL) is required for this dataset",

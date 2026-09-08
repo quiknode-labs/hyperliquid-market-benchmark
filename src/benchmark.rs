@@ -7,10 +7,10 @@ use serde::Serialize;
 use crate::axiom::IngestHealthSnapshot;
 use crate::clock::ClockHealthSnapshot;
 use crate::model::{
-    BaseKey, ContentKey, Dataset, EventKey, FILLS_VPC_COHORT, FILLS_VPC_PROVIDERS,
-    MEMPOOL_VPC_COHORT, MEMPOOL_VPC_MEASUREMENT_VERSION, MEMPOOL_VPC_METRIC_KIND,
-    MEMPOOL_VPC_PROVIDERS, MarketEvent, PROVIDERS, PeeringMode, ProbeEvent, Provider,
-    RuntimeSignals,
+    BaseKey, ContentKey, Dataset, EventKey, FILLS_VPC_COHORT, FILLS_VPC_MEASUREMENT_VERSION,
+    FILLS_VPC_PROVIDERS, MEMPOOL_VPC_COHORT, MEMPOOL_VPC_MEASUREMENT_VERSION,
+    MEMPOOL_VPC_METRIC_KIND, MEMPOOL_VPC_PROVIDERS, MarketEvent, PROVIDERS, PeeringMode,
+    ProbeEvent, Provider, RuntimeSignals,
 };
 
 #[cfg(test)]
@@ -136,6 +136,8 @@ impl BenchmarkConfig {
     pub fn measurement_version(&self) -> &'static str {
         match self.dataset {
             Dataset::Mempool if self.vpc_local => MEMPOOL_VPC_MEASUREMENT_VERSION,
+            // Same metric (fill time → canonical-fill-ready), one source: the box's node.
+            Dataset::Fills if self.vpc_local => FILLS_VPC_MEASUREMENT_VERSION,
             _ => self.dataset.measurement_version(),
         }
     }
@@ -153,6 +155,8 @@ impl BenchmarkConfig {
     pub fn reference_provider(&self) -> Provider {
         match self.dataset {
             Dataset::Peering => self.peering_mode.reference_provider(),
+            // The node is the only source on the box, so it is its own reference set.
+            Dataset::Fills if self.vpc_local => Provider::QuickNodeVpc,
             _ => self.dataset.reference_provider(),
         }
     }
@@ -161,6 +165,8 @@ impl BenchmarkConfig {
         match self.dataset {
             // The VPC leg always makes a peering or mempool cohort at least two sources wide.
             Dataset::Peering | Dataset::Mempool if self.vpc_local => true,
+            // Fills on the box is the node alone: no race, no fastest share.
+            Dataset::Fills if self.vpc_local => false,
             Dataset::Peering => self.peering_mode.has_provider_comparison(),
             _ => self.dataset.has_provider_comparison(),
         }
@@ -2834,7 +2840,7 @@ mod tests {
         );
     }
     #[test]
-    fn vpc_local_widens_the_fills_cohort_to_three_sources_and_nothing_else() {
+    fn vpc_local_makes_fills_the_node_alone_and_widens_peering_and_mempool() {
         let mut config = BenchmarkConfig::production(
             Dataset::Fills,
             vec!["BTC".to_owned()],
@@ -2848,20 +2854,15 @@ mod tests {
             config.providers(),
             &[Provider::FoundationWs, Provider::QuickNodeGrpc]
         );
+        assert!(config.has_provider_comparison());
+        assert_eq!(config.measurement_version(), "canonical-trade-ready-v1");
         config.vpc_local = true;
-        assert_eq!(
-            config.providers(),
-            &[
-                Provider::FoundationWs,
-                Provider::QuickNodeGrpc,
-                Provider::QuickNodeVpc
-            ]
-        );
-        assert_eq!(
-            config.cohort(),
-            "hyperliquid-ws+quicknode-grpc+quicknode-vpc"
-        );
-        assert_eq!(config.reference_provider(), Provider::FoundationWs);
+        // On the box no network feed is dialed: the node is the only source and its own reference.
+        assert_eq!(config.providers(), &[Provider::QuickNodeVpc]);
+        assert_eq!(config.cohort(), "quicknode-vpc");
+        assert_eq!(config.reference_provider(), Provider::QuickNodeVpc);
+        assert!(!config.has_provider_comparison());
+        assert_eq!(config.measurement_version(), "fills-vpc-node-v1");
         let mut mempool = BenchmarkConfig::production(
             Dataset::Mempool,
             vec!["BTC".to_owned()],
@@ -2886,7 +2887,7 @@ mod tests {
         assert_eq!(mempool.metric_kind(), "mempool_first_seen_to_bundle_ready");
         assert_eq!(mempool.measurement_version(), "mempool-bundle-ready-v1");
         assert!(!mempool.has_provider_comparison());
-        // Fills on the box keeps its metric names: only the cohort widens.
+        // Fills on the box keeps the metric: fill time → canonical-fill-ready, at the node.
         assert_eq!(config.metric_kind(), "event_to_canonical_trade_ready");
     }
 

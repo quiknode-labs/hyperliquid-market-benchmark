@@ -20,14 +20,14 @@ pub const BOOK_PROVIDERS: [Provider; 3] = [
     Provider::QuickNodeGrpc,
 ];
 pub const FILLS_PROVIDERS: [Provider; 2] = [Provider::FoundationWs, Provider::QuickNodeGrpc];
-/// Fills with the Quicknode VPC source: the collector runs on the VPC box and reads that box's own
-/// node output beside the two network feeds, so all three are one exact cohort on one clock.
-pub const FILLS_VPC_PROVIDERS: [Provider; 3] = [
-    Provider::FoundationWs,
-    Provider::QuickNodeGrpc,
-    Provider::QuickNodeVpc,
-];
-pub const FILLS_VPC_COHORT: &str = "hyperliquid-ws+quicknode-grpc+quicknode-vpc";
+/// Fills on the Quicknode VPC box: the collector runs on the box and reads only that box's own
+/// node output (`node_fills_by_block`). No network feed is dialed from the box — the product is
+/// the node beside the sentry, so its fills are recorded where they land and scored on their own,
+/// from the fill's own timestamp, one sample per trade. Comparison against the network paths
+/// happens on the dashboard, which draws this leg beside any observer's cohort.
+pub const FILLS_VPC_PROVIDERS: [Provider; 1] = [Provider::QuickNodeVpc];
+pub const FILLS_VPC_COHORT: &str = "quicknode-vpc";
+pub const FILLS_VPC_MEASUREMENT_VERSION: &str = "fills-vpc-node-v1";
 pub const MEMPOOL_PROVIDERS: [Provider; 1] = [Provider::QuickNodeGrpc];
 /// Mempool with the Quicknode VPC source: the collector on the VPC box reads the co-located sentry's
 /// `bundle` lines beside the Quicknode gRPC mempool stream; both legs share one reference per bundle

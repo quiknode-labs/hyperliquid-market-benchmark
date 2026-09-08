@@ -48,7 +48,7 @@ consumer must not replace an omitted value with zero.
 | `window_end` | RFC 3339 string | End of the rolling distribution. |
 | `window_seconds` | integer | Rolling distribution duration; currently 300. |
 | `publish_interval_seconds` | integer | Nominal publication cadence; currently 30. |
-| `cohort` | string | Exact dataset-specific source set. Mempool uses the one-source value `quicknode-grpc`; on the Quicknode VPC box it is `quicknode-grpc+quicknode-vpc` with `metric_kind` `box_first_seen_to_bundle_ready` and `measurement_version` `mempool-box-first-seen-v1` (`METHODOLOGY.md`, "The Quicknode VPC source"). |
+| `cohort` | string | Exact dataset-specific source set. Mempool uses the one-source value `quicknode-grpc`; on the Quicknode VPC box it is `quicknode-grpc+quicknode-vpc` with `metric_kind` `box_first_seen_to_bundle_ready` and `measurement_version` `mempool-box-first-seen-v1`. Fills on the box is the one-source cohort `quicknode-vpc` (`measurement_version` `fills-vpc-node-v1`, metric unchanged) (`METHODOLOGY.md`, "The Quicknode VPC source"). |
 | `coverage_count_scope` | string | `rolling-window` for coverage counts. |
 | `health_count_scope` | string | `run-lifetime` for cumulative health counters. |
 
@@ -116,7 +116,7 @@ Mempool has no provider race. It emits `outcome_count_scope=not-applicable`,
 | `outcome_interval_complete` | boolean | Exact nominal duration after startup and all cohort-health gates passed. |
 | `outcome_complete_cohort_count` | integer | Complete exact cohorts committed in this interval. |
 | `outcome_quicknode_strict_fastest_count` | integer | Cohorts with Quicknode (gRPC or peering, whichever the process dials) as the unique minimum absolute latency. |
-| `outcome_quicknode_vpc_strict_fastest_count` | integer | Cohorts with the Quicknode VPC leg as the unique minimum; zero unless the cohort contains `quicknode-vpc` (fills `hyperliquid-ws+quicknode-grpc+quicknode-vpc`; peering `quicknode-peering-tcp+quicknode-vpc` and its variants). |
+| `outcome_quicknode_vpc_strict_fastest_count` | integer | Cohorts with the Quicknode VPC leg as the unique minimum; zero unless the cohort contains `quicknode-vpc` and at least one other source (peering `quicknode-peering-tcp+quicknode-vpc` and its variants; mempool `quicknode-grpc+quicknode-vpc`). Fills on the box is the one-source cohort `quicknode-vpc` and carries no fastest share. |
 | `outcome_foundation_strict_fastest_count` | integer | Cohorts with Foundation as the unique minimum. |
 | `outcome_hydromancer_strict_fastest_count` | integer | Cohorts with Hydromancer as the unique minimum. |
 | `outcome_tie_count` | integer | Cohorts whose minimum was shared by at least two paths. |

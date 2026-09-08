@@ -4,6 +4,15 @@ All notable changes to the collector and measurement contract are documented
 here. Versions follow Semantic Versioning; measurement-contract changes are
 also identified independently in emitted events.
 
+## Unreleased
+
+- Fills on the Quicknode VPC box (`--vpc-node-data`) is now the node alone: cohort
+  `quicknode-vpc`, `measurement_version` `fills-vpc-node-v1`, metric unchanged, no
+  network feed and no gRPC token from the box. The earlier three-source shape
+  (`hyperliquid-ws+quicknode-grpc+quicknode-vpc`) is withdrawn; the comparison with
+  the network paths is drawn on the dashboard instead.
+- The VPC box's public identity is cloud `vpc`, runner `vpc-nrt-01`.
+
 ## 0.4.0 - 2026-08-10
 
 - Add the `peering` dataset: absolute delivery latency and completeness of
