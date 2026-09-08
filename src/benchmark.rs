@@ -2838,10 +2838,10 @@ mod tests {
         let mut config = BenchmarkConfig::production(
             Dataset::Fills,
             vec!["BTC".to_owned()],
-            "teraswitch".to_owned(),
+            "vpc".to_owned(),
             "nrt".to_owned(),
             "nrt".to_owned(),
-            "teraswitch-nrt-01".to_owned(),
+            "vpc-nrt-01".to_owned(),
             "test-run".to_owned(),
         );
         assert_eq!(
@@ -2865,10 +2865,10 @@ mod tests {
         let mut mempool = BenchmarkConfig::production(
             Dataset::Mempool,
             vec!["BTC".to_owned()],
-            "teraswitch".to_owned(),
+            "vpc".to_owned(),
             "nrt".to_owned(),
             "nrt".to_owned(),
-            "teraswitch-nrt-01".to_owned(),
+            "vpc-nrt-01".to_owned(),
             "test-run".to_owned(),
         );
         mempool.vpc_local = true;
@@ -2895,10 +2895,10 @@ mod tests {
         let mut config = BenchmarkConfig::production(
             Dataset::Peering,
             vec!["BLOCKS".to_owned()],
-            "teraswitch".to_owned(),
+            "vpc".to_owned(),
             "nrt".to_owned(),
             "nrt".to_owned(),
-            "teraswitch-nrt-01".to_owned(),
+            "vpc-nrt-01".to_owned(),
             "test-run".to_owned(),
         );
         assert!(!config.has_provider_comparison());

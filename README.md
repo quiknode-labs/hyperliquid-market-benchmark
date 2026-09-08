@@ -170,14 +170,14 @@ the box's own node output to the fills cohort:
 
 ```bash
 VPC_NODE_DATA=/data/hype/mainnet/hl_visor/hl/data \
-hyperliquid-market-benchmark --dataset fills --coins BTC --runner teraswitch-nrt-01
+hyperliquid-market-benchmark --dataset fills --coins BTC --runner vpc-nrt-01
 ```
 
 `--vpc-node-data` tails `node_fills_by_block` as the `quicknode-vpc` provider beside the
 Quicknode gRPC and Foundation subscriptions the same process holds, so the three paths form one
 exact cohort per trade with one clock (`docs/METHODOLOGY.md`, "The Quicknode VPC source"). It is
 refused for any other dataset and when the directory has no fills tree. The runner is public
-like every other (`cloud` `teraswitch`).
+like every other (`cloud` `vpc`).
 
 For peering the same box adds the sentry's own decoded stream — the customer-facing socket that
 writes each consensus round's decoded `block` line as the ordering arrives — as the
@@ -186,7 +186,7 @@ writes each consensus round's decoded `block` line as the ordering arrives — a
 ```bash
 PEERING_PROVIDER=quicknode QUICKNODE_PEERING_ENDPOINT=<gossip serve host:port> \
 PEERING_REFERENCE_FEED=<node host:9464> VPC_DECODED_SOCKET=<sentry decoded host:port> \
-hyperliquid-market-benchmark --dataset peering --coins BLOCKS --runner teraswitch-nrt-01
+hyperliquid-market-benchmark --dataset peering --coins BLOCKS --runner vpc-nrt-01
 ```
 
 `--vpc-decoded-socket` is refused for any other dataset and when it names a wire the process
@@ -198,7 +198,7 @@ mempool stream, both timed from the box's first sight of each BTC bundle:
 
 ```bash
 VPC_DECODED_SOCKET=<sentry decoded host:port> \
-hyperliquid-market-benchmark --dataset mempool --coins BTC --runner teraswitch-nrt-01
+hyperliquid-market-benchmark --dataset mempool --coins BTC --runner vpc-nrt-01
 ```
 
 Rows then carry `metric_kind` `box_first_seen_to_bundle_ready` (`docs/METHODOLOGY.md`, "The

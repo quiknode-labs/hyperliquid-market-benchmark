@@ -81,7 +81,7 @@ boundary as the gRPC leg. Only lines written after the collector started are tim
 What this does and does not claim: it compares three delivery paths of the same executed
 fill at one observer that happens to be the VPC box; the VPC leg's advantage is the absence
 of a network hop and of a provider pipeline, not a faster matching engine. Runner identity is
-public like every other runner (`teraswitch-nrt-01`, cloud `teraswitch`), and the
+public like every other runner (`vpc-nrt-01`, cloud `vpc`), and the
 `quicknode-vpc` provider can only be stamped by a collector on such a box, so it never
 appears from a network observer. Outcome columns for it are `outcome_quicknode_vpc_*`; it is
 not folded into the Quicknode family because both Quicknode paths are present in one cohort.

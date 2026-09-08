@@ -29,7 +29,7 @@ const COHORT_TIMEOUT: Duration = Duration::from_secs(5);
 const COHORT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 const STALE_AFTER: Duration = Duration::from_secs(60);
 const MAX_COINS_PER_PROCESS: usize = 10;
-const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle", "teraswitch"];
+const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle", "vpc"];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -594,7 +594,7 @@ fn infer_location(runner: &str) -> (Option<String>, Option<String>, Option<Strin
         .collect::<Vec<_>>();
     let cloud = parts
         .iter()
-        .find(|part| matches!(part.as_str(), "aws" | "gcp" | "oracle" | "teraswitch"))
+        .find(|part| matches!(part.as_str(), "aws" | "gcp" | "oracle" | "vpc"))
         .cloned();
     let region = parts.iter().find_map(|part| match part.as_str() {
         "iad" | "fra" | "nrt" | "sin" => Some(part.clone()),
@@ -925,11 +925,11 @@ mod tests {
             Some(root.clone())
         );
         let _ = std::fs::remove_dir_all(&root);
-        assert!(validate_public_identity("teraswitch-nrt-01", "teraswitch", "nrt", "nrt").is_ok());
+        assert!(validate_public_identity("vpc-nrt-01", "vpc", "nrt", "nrt").is_ok());
         assert_eq!(
-            infer_location("teraswitch-nrt-01"),
+            infer_location("vpc-nrt-01"),
             (
-                Some("teraswitch".to_owned()),
+                Some("vpc".to_owned()),
                 Some("nrt".to_owned()),
                 Some("nrt".to_owned())
             )
