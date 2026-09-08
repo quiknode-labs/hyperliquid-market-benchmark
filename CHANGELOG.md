@@ -6,6 +6,12 @@ also identified independently in emitted events.
 
 ## Unreleased
 
+- Books on the Quicknode VPC box (`--vpc-grpc-url http://127.0.0.1:10000`, bbo and l2book
+  only, loopback plaintext only, no token): the box's own Quicknode gRPC service is the
+  single `quicknode-vpc` source, cohort `quicknode-vpc`, `measurement_version`
+  `bbo-vpc-grpc-v1` / `l2book-vpc-grpc-v1`, metric unchanged. The Quicknode gRPC client is
+  now stamped by provider so the same subscription and canonical-book boundary serve both
+  the public endpoint and the box's own service.
 - Fills on the Quicknode VPC box (`--vpc-node-data`) is now the node alone: cohort
   `quicknode-vpc`, `measurement_version` `fills-vpc-node-v1`, metric unchanged, no
   network feed and no gRPC token from the box. The earlier three-source shape

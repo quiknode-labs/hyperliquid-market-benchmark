@@ -98,6 +98,14 @@ struct Args {
     #[arg(long, env = "VPC_DECODED_SOCKET")]
     vpc_decoded_socket: Option<String>,
 
+    /// Loopback origin of the Quicknode gRPC service running on THIS box (raptor-grpc beside the
+    /// node, e.g. `http://127.0.0.1:10000`). Books only (bbo, l2book): the process then dials no
+    /// network feed and records the box's own service as the single `quicknode-vpc` source,
+    /// through the same subscription and canonical-book boundary as the Quicknode gRPC leg, with
+    /// no token. See METHODOLOGY.
+    #[arg(long, env = "VPC_GRPC_URL")]
+    vpc_grpc_url: Option<String>,
+
     /// Cloud measurement location. Inferred from the public runner ID when absent.
     #[arg(long, env = "BENCHMARK_CLOUD")]
     cloud: Option<String>,
@@ -187,23 +195,27 @@ async fn main() -> Result<()> {
     )?;
     validate_public_identity(&args.runner, &cloud, &region, &metro)?;
 
+    // Fills on the VPC box reads the node alone and books read the box's own gRPC alone: no
+    // network feed, no token (METHODOLOGY, "The Quicknode VPC source").
+    let vpc_node_only = args.dataset == Dataset::Fills && args.vpc_node_data.is_some();
+    let vpc_grpc_only =
+        matches!(args.dataset, Dataset::Bbo | Dataset::L2book) && args.vpc_grpc_url.is_some();
+    let vpc_only = vpc_node_only || vpc_grpc_only;
     let hydromancer_token = if args
         .dataset
         .providers()
         .contains(&model::Provider::HydromancerWs)
+        && !vpc_only
     {
         required_secret("HYDROMANCER_API_KEY")?
     } else {
         String::new()
     };
-    // Fills on the VPC box reads the node alone: no network feed, no token (METHODOLOGY, "The
-    // Quicknode VPC source").
-    let vpc_node_only = args.dataset == Dataset::Fills && args.vpc_node_data.is_some();
     let quicknode_token = if args
         .dataset
         .providers()
         .contains(&model::Provider::QuickNodeGrpc)
-        && !vpc_node_only
+        && !vpc_only
     {
         let token = required_secret("QUICKNODE_HYPERLIQUID_TOKEN")?;
         tonic::metadata::MetadataValue::try_from(token.as_str())
@@ -216,7 +228,7 @@ async fn main() -> Result<()> {
         .dataset
         .providers()
         .contains(&model::Provider::QuickNodeGrpc)
-        && !vpc_node_only
+        && !vpc_only
     {
         args.quicknode_grpc.clone().context(
             "--quicknode-grpc (QUICKNODE_HYPERLIQUID_GRPC_URL) is required for this dataset",
@@ -298,7 +310,9 @@ async fn main() -> Result<()> {
         &peering_endpoints,
         &peering_reference,
     )?;
-    config.vpc_local = vpc_node_data.is_some() || vpc_decoded_socket.is_some();
+    let vpc_grpc = validate_vpc_grpc(args.dataset, args.vpc_grpc_url.clone())?;
+    config.vpc_local =
+        vpc_node_data.is_some() || vpc_decoded_socket.is_some() || vpc_grpc.is_some();
     let mut benchmark = Benchmark::new(config, now, wall_now);
 
     let signals = Arc::new(RuntimeSignals::new(&coins));
@@ -317,6 +331,7 @@ async fn main() -> Result<()> {
             peering_reference,
             vpc_node_data,
             vpc_decoded_socket,
+            vpc_grpc,
         },
         sender,
     );
@@ -560,6 +575,19 @@ fn validate_vpc_node_data(dataset: Dataset, path: Option<PathBuf>) -> Result<Opt
         );
     }
     Ok(Some(path))
+}
+
+/// `--vpc-grpc-url` is accepted only where the source exists (books) and only as a loopback
+/// plaintext origin, so a public endpoint can never be published under the box's name.
+fn validate_vpc_grpc(dataset: Dataset, url: Option<String>) -> Result<Option<String>> {
+    let Some(url) = url else { return Ok(None) };
+    if !matches!(dataset, Dataset::Bbo | Dataset::L2book) {
+        anyhow::bail!(
+            "--vpc-grpc-url (VPC_GRPC_URL) is only supported for the bbo and l2book datasets, not {}",
+            dataset.label()
+        );
+    }
+    Ok(Some(streams::validate_vpc_grpc_endpoint(&url)?))
 }
 
 /// The decoded stream socket is a peering/mempool source, and it may never be the same wire as a
@@ -913,6 +941,31 @@ mod tests {
 
         assert!(config.max_rolling_cohorts >= required_rolling);
     }
+    #[test]
+    fn vpc_grpc_url_is_books_only_and_loopback() {
+        assert!(validate_vpc_grpc(Dataset::Bbo, None).unwrap().is_none());
+        assert_eq!(
+            validate_vpc_grpc(Dataset::Bbo, Some("http://127.0.0.1:10000".to_owned())).unwrap(),
+            Some("http://127.0.0.1:10000".to_owned())
+        );
+        assert!(
+            validate_vpc_grpc(Dataset::L2book, Some("http://localhost:10000".to_owned())).is_ok()
+        );
+        assert!(
+            validate_vpc_grpc(Dataset::Fills, Some("http://127.0.0.1:10000".to_owned())).is_err()
+        );
+        assert!(
+            validate_vpc_grpc(Dataset::Mempool, Some("http://127.0.0.1:10000".to_owned())).is_err()
+        );
+        assert!(
+            validate_vpc_grpc(
+                Dataset::Bbo,
+                Some("https://example-guide-demo.hype-mainnet.quiknode.pro:10000".to_owned())
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn vpc_node_data_is_fills_only_and_must_hold_a_fills_tree() {
         let root = std::env::temp_dir().join(format!("vpc-node-data-{}", std::process::id()));

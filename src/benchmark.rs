@@ -7,8 +7,9 @@ use serde::Serialize;
 use crate::axiom::IngestHealthSnapshot;
 use crate::clock::ClockHealthSnapshot;
 use crate::model::{
-    BaseKey, ContentKey, Dataset, EventKey, FILLS_VPC_COHORT, FILLS_VPC_MEASUREMENT_VERSION,
-    FILLS_VPC_PROVIDERS, MEMPOOL_VPC_COHORT, MEMPOOL_VPC_MEASUREMENT_VERSION,
+    BBO_VPC_MEASUREMENT_VERSION, BOOK_VPC_COHORT, BOOK_VPC_PROVIDERS, BaseKey, ContentKey, Dataset,
+    EventKey, FILLS_VPC_COHORT, FILLS_VPC_MEASUREMENT_VERSION, FILLS_VPC_PROVIDERS,
+    L2BOOK_VPC_MEASUREMENT_VERSION, MEMPOOL_VPC_COHORT, MEMPOOL_VPC_MEASUREMENT_VERSION,
     MEMPOOL_VPC_METRIC_KIND, MEMPOOL_VPC_PROVIDERS, MarketEvent, PROVIDERS, PeeringMode,
     ProbeEvent, Provider, RuntimeSignals,
 };
@@ -72,9 +73,10 @@ pub struct BenchmarkConfig {
     /// by every other dataset, which keeps its static provider set.
     pub peering_mode: PeeringMode,
     /// The collector runs on a Quicknode VPC box and reads a local surface of the product as the
-    /// `quicknode-vpc` provider: the node's own fills output (fills), the co-located sentry's
-    /// decoded `block` lines (peering) or its `bundle` lines (mempool). Widens that dataset's
-    /// cohort by one source; for mempool it also changes the reference (see `metric_kind`).
+    /// `quicknode-vpc` provider: the node's own fills output (fills), the box's own Quicknode gRPC
+    /// service over loopback (bbo, l2book), the co-located sentry's decoded `block` lines
+    /// (peering) or its `bundle` lines (mempool). Fills and books become that one source alone;
+    /// peering and mempool gain a leg, and mempool also changes its reference (see `metric_kind`).
     pub vpc_local: bool,
 }
 
@@ -118,6 +120,7 @@ impl BenchmarkConfig {
             Dataset::Peering if self.vpc_local => self.peering_mode.vpc_providers(),
             Dataset::Peering => self.peering_mode.providers(),
             Dataset::Fills if self.vpc_local => &FILLS_VPC_PROVIDERS,
+            Dataset::Bbo | Dataset::L2book if self.vpc_local => &BOOK_VPC_PROVIDERS,
             Dataset::Mempool if self.vpc_local => &MEMPOOL_VPC_PROVIDERS,
             _ => self.dataset.providers(),
         }
@@ -138,6 +141,9 @@ impl BenchmarkConfig {
             Dataset::Mempool if self.vpc_local => MEMPOOL_VPC_MEASUREMENT_VERSION,
             // Same metric (fill time → canonical-fill-ready), one source: the box's node.
             Dataset::Fills if self.vpc_local => FILLS_VPC_MEASUREMENT_VERSION,
+            // Same metric (event time → canonical-book-ready), one source: the box's own gRPC.
+            Dataset::Bbo if self.vpc_local => BBO_VPC_MEASUREMENT_VERSION,
+            Dataset::L2book if self.vpc_local => L2BOOK_VPC_MEASUREMENT_VERSION,
             _ => self.dataset.measurement_version(),
         }
     }
@@ -147,6 +153,7 @@ impl BenchmarkConfig {
             Dataset::Peering if self.vpc_local => self.peering_mode.vpc_cohort(),
             Dataset::Peering => self.peering_mode.cohort(),
             Dataset::Fills if self.vpc_local => FILLS_VPC_COHORT,
+            Dataset::Bbo | Dataset::L2book if self.vpc_local => BOOK_VPC_COHORT,
             Dataset::Mempool if self.vpc_local => MEMPOOL_VPC_COHORT,
             _ => self.dataset.cohort(),
         }
@@ -155,8 +162,11 @@ impl BenchmarkConfig {
     pub fn reference_provider(&self) -> Provider {
         match self.dataset {
             Dataset::Peering => self.peering_mode.reference_provider(),
-            // The node is the only source on the box, so it is its own reference set.
-            Dataset::Fills if self.vpc_local => Provider::QuickNodeVpc,
+            // The node (fills) or the box's own gRPC (books) is the only source on the box, so it
+            // is its own reference set.
+            Dataset::Fills | Dataset::Bbo | Dataset::L2book if self.vpc_local => {
+                Provider::QuickNodeVpc
+            }
             _ => self.dataset.reference_provider(),
         }
     }
@@ -165,8 +175,9 @@ impl BenchmarkConfig {
         match self.dataset {
             // The VPC leg always makes a peering or mempool cohort at least two sources wide.
             Dataset::Peering | Dataset::Mempool if self.vpc_local => true,
-            // Fills on the box is the node alone: no race, no fastest share.
-            Dataset::Fills if self.vpc_local => false,
+            // Fills on the box is the node alone, books are the box's own gRPC alone: no race,
+            // no fastest share.
+            Dataset::Fills | Dataset::Bbo | Dataset::L2book if self.vpc_local => false,
             Dataset::Peering => self.peering_mode.has_provider_comparison(),
             _ => self.dataset.has_provider_comparison(),
         }
@@ -2889,6 +2900,30 @@ mod tests {
         assert!(!mempool.has_provider_comparison());
         // Fills on the box keeps the metric: fill time → canonical-fill-ready, at the node.
         assert_eq!(config.metric_kind(), "event_to_canonical_trade_ready");
+        // Books on the box are the box's own Quicknode gRPC alone, same metric, own versions.
+        for (dataset, version) in [
+            (Dataset::Bbo, "bbo-vpc-grpc-v1"),
+            (Dataset::L2book, "l2book-vpc-grpc-v1"),
+        ] {
+            let mut book = BenchmarkConfig::production(
+                dataset,
+                vec!["BTC".to_owned()],
+                "vpc".to_owned(),
+                "nrt".to_owned(),
+                "nrt".to_owned(),
+                "vpc-nrt-01".to_owned(),
+                "test-run".to_owned(),
+            );
+            assert_eq!(book.providers().len(), 3);
+            book.vpc_local = true;
+            assert_eq!(book.providers(), &[Provider::QuickNodeVpc]);
+            assert_eq!(book.cohort(), "quicknode-vpc");
+            assert_eq!(book.reference_provider(), Provider::QuickNodeVpc);
+            assert!(!book.has_provider_comparison());
+            assert!(!book.canonical_by_any_arrival());
+            assert_eq!(book.measurement_version(), version);
+            assert_eq!(book.metric_kind(), "event_to_canonical_book_ready");
+        }
     }
 
     #[test]

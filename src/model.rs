@@ -19,6 +19,15 @@ pub const BOOK_PROVIDERS: [Provider; 3] = [
     Provider::HydromancerWs,
     Provider::QuickNodeGrpc,
 ];
+/// Books (bbo, l2book) on the Quicknode VPC box: the collector reads the box's own Quicknode gRPC
+/// service — raptor-grpc beside the node, fed through the shared-memory write hook — over loopback
+/// as the single `quicknode-vpc` source. Same event-timestamp reference and canonical-book-ready
+/// boundary as the fleet's Quicknode gRPC leg, one sample per event; no network feed is dialed
+/// from the box. The comparison with the network paths is drawn on the dashboard.
+pub const BOOK_VPC_PROVIDERS: [Provider; 1] = [Provider::QuickNodeVpc];
+pub const BOOK_VPC_COHORT: &str = "quicknode-vpc";
+pub const BBO_VPC_MEASUREMENT_VERSION: &str = "bbo-vpc-grpc-v1";
+pub const L2BOOK_VPC_MEASUREMENT_VERSION: &str = "l2book-vpc-grpc-v1";
 pub const FILLS_PROVIDERS: [Provider; 2] = [Provider::FoundationWs, Provider::QuickNodeGrpc];
 /// Fills on the Quicknode VPC box: the collector runs on the box and reads only that box's own
 /// node output (`node_fills_by_block`). No network feed is dialed from the box — the product is
@@ -216,9 +225,10 @@ pub enum Provider {
     QuickNodePeeringTcp,
     HydromancerPeeringTcp,
     /// The Quicknode VPC product read on the box that runs it: a Hyperliquid node fed by a
-    /// co-located Quicknode sentry, observed through the node's own output files (fills) or the
-    /// sentry's decoded stream socket (peering). Only a collector running on that box can stamp
-    /// this provider; it never appears from a network observer.
+    /// co-located Quicknode sentry, observed through the node's own output files (fills), the
+    /// sentry's decoded stream socket (peering, mempool) or the box's own Quicknode gRPC service
+    /// over loopback (bbo, l2book). Only a collector running on that box can stamp this provider;
+    /// it never appears from a network observer.
     QuickNodeVpc,
 }
 

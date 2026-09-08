@@ -62,7 +62,7 @@ canonical trade. This measures public trade-feed delivery. It does not measure
 customer order submission, acknowledgement, order-to-fill, or exchange
 matching-engine execution latency.
 
-## The Quicknode VPC source (fills, peering and mempool)
+## The Quicknode VPC source (fills, books, peering and mempool)
 
 A Quicknode VPC box runs a Hyperliquid node fed by a co-located Quicknode sentry, and the
 customer's own client runs on that box. Its fills are measured where a co-located client would
@@ -90,6 +90,22 @@ public like every other runner (`vpc-nrt-01`, cloud `vpc`), and the
 `quicknode-vpc` provider can only be stamped by a collector on such a box, so it never
 appears from a network observer. Outcome columns for it are `outcome_quicknode_vpc_*`; it is
 not folded into the Quicknode family because both Quicknode paths are present in one cohort.
+
+**Books (bbo, l2book).** The box also runs the Quicknode gRPC service itself — raptor-grpc beside
+the node, fed by the node through the shared-memory write hook — and a client on the box reaches
+it by a loopback URL. The book collectors on the box (`--vpc-grpc-url http://127.0.0.1:10000`)
+read that service as the single `quicknode-vpc` source: the same gRPC subscription, the same
+canonical-book construction (depth-20 L2, crossed books rejected) and the same
+canonical-book-ready boundary as the fleet's Quicknode gRPC leg, timed from the event's own
+timestamp, one sample per event. No network feed is dialed and no token is sent (there is no edge
+in front of the service). Cohort `quicknode-vpc`, `measurement_version` `bbo-vpc-grpc-v1` and
+`l2book-vpc-grpc-v1`, metric unchanged (`event_to_canonical_book_ready`), so the leg shares a
+reference clock with any observer's three-source book cohort and the dashboard draws it beside
+that cohort. What it claims: the delivery latency of the Quicknode order-book stream to a client on
+the box, without the network hop and without the edge in front of the public endpoint. What it does
+not claim: a cross-checked book — with one source on the box there is no second path to agree
+with, so the admission is the leg's own decode and canonical construction, and it carries no
+fastest share.
 
 **Peering.** On the same box the peering collector adds the sentry itself as the VPC leg
 (`--vpc-decoded-socket <host:port>`). It subscribes to the sentry's decoded stream — the

@@ -163,7 +163,7 @@ explicit incomplete cohort without stopping the other streams. Every
 30-second window must be durably admitted within 20 seconds; if local
 publication stalls, the process exits so its service supervisor can restart it.
 
-### The Quicknode VPC source (fills, peering and mempool, on the VPC box)
+### The Quicknode VPC source (fills, books, peering and mempool, on the VPC box)
 
 A collector running on a Quicknode VPC box (sentry + Hyperliquid node on one machine) records
 the box's own node output as the fills source:
@@ -180,6 +180,24 @@ at the node, the same boundary the gRPC path is scored at elsewhere, so the dash
 this leg beside any observer's cohort (`docs/METHODOLOGY.md`, "The Quicknode VPC source"). It is
 refused for any other dataset and when the directory has no fills tree. The runner is public
 like every other (`cloud` `vpc`).
+
+For the book datasets the same box reads its own Quicknode gRPC service — raptor-grpc running
+beside the node, fed through the shared-memory write hook — over loopback, as the single
+`quicknode-vpc` source:
+
+```bash
+VPC_GRPC_URL=http://127.0.0.1:10000 \
+hyperliquid-market-benchmark --dataset bbo --coins BTC --runner vpc-nrt-01
+VPC_GRPC_URL=http://127.0.0.1:10000 \
+hyperliquid-market-benchmark --dataset l2book --coins BTC --runner vpc-nrt-01
+```
+
+`--vpc-grpc-url` is refused for any other dataset and for anything but a plaintext loopback
+origin with a port (there is no edge in front of the box's service, so no token). Cohort
+`quicknode-vpc`, `measurement_version` `bbo-vpc-grpc-v1` / `l2book-vpc-grpc-v1`, metric
+unchanged: the same subscription, canonical-book construction and boundary as the Quicknode gRPC
+leg, timed from the event's own timestamp, so the dashboard draws this leg beside any observer's
+three-source cohort.
 
 For peering the same box adds the sentry's own decoded stream — the customer-facing socket that
 writes each consensus round's decoded `block` line as the ordering arrives — as the
