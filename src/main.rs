@@ -19,6 +19,7 @@ mod grpc;
 mod model;
 mod peering;
 mod streams;
+mod vpc_mempool;
 
 const EVENT_QUEUE_CAPACITY: usize = 16_384;
 const ROLLING_WINDOW: Duration = Duration::from_secs(300);
@@ -28,7 +29,7 @@ const COHORT_TIMEOUT: Duration = Duration::from_secs(5);
 const COHORT_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 const STALE_AFTER: Duration = Duration::from_secs(60);
 const MAX_COINS_PER_PROCESS: usize = 10;
-const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle"];
+const PUBLIC_CLOUDS: &[&str] = &["aws", "gcp", "oracle", "vpc"];
 
 #[derive(Debug, Parser)]
 #[command(
@@ -82,6 +83,28 @@ struct Args {
     /// reproducible from any Hyperliquid node's replay output; see METHODOLOGY.
     #[arg(long, env = "PEERING_REFERENCE_FEED")]
     peering_reference: Option<String>,
+
+    /// `hl/data` of the Hyperliquid node running on THIS box. Fills dataset only: the process
+    /// then dials no network feed and records the box's own node output as the single
+    /// `quicknode-vpc` source, timed from each fill's own timestamp. See METHODOLOGY.
+    #[arg(long, env = "VPC_NODE_DATA")]
+    vpc_node_data: Option<PathBuf>,
+
+    /// `host:port` of the co-located Quicknode sentry's decoded stream (its LANERACER_DECODED_TCP
+    /// listener) on THIS box. Enables the `quicknode-vpc` provider for peering (the sentry's `block`
+    /// line per round joins the cohort beside the dialed peering service(s)) and for mempool (the
+    /// sentry's `bundle` line per bundle joins the Quicknode gRPC leg, both referenced to the box's
+    /// first sight of the bundle). One process, one clock. See METHODOLOGY.
+    #[arg(long, env = "VPC_DECODED_SOCKET")]
+    vpc_decoded_socket: Option<String>,
+
+    /// Loopback origin of the Quicknode gRPC service running on THIS box (raptor-grpc beside the
+    /// node, e.g. `http://127.0.0.1:10000`). Books only (bbo, l2book): the process then dials no
+    /// network feed and records the box's own service as the single `quicknode-vpc` source,
+    /// through the same subscription and canonical-book boundary as the Quicknode gRPC leg, with
+    /// no token. See METHODOLOGY.
+    #[arg(long, env = "VPC_GRPC_URL")]
+    vpc_grpc_url: Option<String>,
 
     /// Cloud measurement location. Inferred from the public runner ID when absent.
     #[arg(long, env = "BENCHMARK_CLOUD")]
@@ -172,10 +195,17 @@ async fn main() -> Result<()> {
     )?;
     validate_public_identity(&args.runner, &cloud, &region, &metro)?;
 
+    // Fills on the VPC box reads the node alone and books read the box's own gRPC alone: no
+    // network feed, no token (METHODOLOGY, "The Quicknode VPC source").
+    let vpc_node_only = args.dataset == Dataset::Fills && args.vpc_node_data.is_some();
+    let vpc_grpc_only =
+        matches!(args.dataset, Dataset::Bbo | Dataset::L2book) && args.vpc_grpc_url.is_some();
+    let vpc_only = vpc_node_only || vpc_grpc_only;
     let hydromancer_token = if args
         .dataset
         .providers()
         .contains(&model::Provider::HydromancerWs)
+        && !vpc_only
     {
         required_secret("HYDROMANCER_API_KEY")?
     } else {
@@ -185,6 +215,7 @@ async fn main() -> Result<()> {
         .dataset
         .providers()
         .contains(&model::Provider::QuickNodeGrpc)
+        && !vpc_only
     {
         let token = required_secret("QUICKNODE_HYPERLIQUID_TOKEN")?;
         tonic::metadata::MetadataValue::try_from(token.as_str())
@@ -197,6 +228,7 @@ async fn main() -> Result<()> {
         .dataset
         .providers()
         .contains(&model::Provider::QuickNodeGrpc)
+        && !vpc_only
     {
         args.quicknode_grpc.clone().context(
             "--quicknode-grpc (QUICKNODE_HYPERLIQUID_GRPC_URL) is required for this dataset",
@@ -271,6 +303,16 @@ async fn main() -> Result<()> {
     config.stale_after = STALE_AFTER;
     config.artifact_sha256 = artifact_sha256;
     config.peering_mode = peering_mode;
+    let vpc_node_data = validate_vpc_node_data(args.dataset, args.vpc_node_data.clone())?;
+    let vpc_decoded_socket = validate_vpc_decoded_socket(
+        args.dataset,
+        args.vpc_decoded_socket.clone(),
+        &peering_endpoints,
+        &peering_reference,
+    )?;
+    let vpc_grpc = validate_vpc_grpc(args.dataset, args.vpc_grpc_url.clone())?;
+    config.vpc_local =
+        vpc_node_data.is_some() || vpc_decoded_socket.is_some() || vpc_grpc.is_some();
     let mut benchmark = Benchmark::new(config, now, wall_now);
 
     let signals = Arc::new(RuntimeSignals::new(&coins));
@@ -287,6 +329,9 @@ async fn main() -> Result<()> {
             quicknode_token,
             peering_endpoints,
             peering_reference,
+            vpc_node_data,
+            vpc_decoded_socket,
+            vpc_grpc,
         },
         sender,
     );
@@ -511,6 +556,70 @@ fn required_secret(name: &str) -> Result<String> {
         .with_context(|| format!("{name} is required"))
 }
 
+/// `--vpc-node-data` is accepted only where the source exists (fills), and must point at a node
+/// data directory that already writes `node_fills_by_block`, so a misconfigured box fails at
+/// start instead of publishing a cohort that can never complete.
+fn validate_vpc_node_data(dataset: Dataset, path: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(path) = path else { return Ok(None) };
+    if dataset != Dataset::Fills {
+        anyhow::bail!(
+            "--vpc-node-data (VPC_NODE_DATA) is only supported for the fills dataset today, not {}",
+            dataset.label()
+        );
+    }
+    let fills = path.join("node_fills_by_block").join("hourly");
+    if !fills.is_dir() {
+        anyhow::bail!(
+            "--vpc-node-data {} has no node_fills_by_block/hourly directory (is this the node's hl/data?)",
+            path.display()
+        );
+    }
+    Ok(Some(path))
+}
+
+/// `--vpc-grpc-url` is accepted only where the source exists (books) and only as a loopback
+/// plaintext origin, so a public endpoint can never be published under the box's name.
+fn validate_vpc_grpc(dataset: Dataset, url: Option<String>) -> Result<Option<String>> {
+    let Some(url) = url else { return Ok(None) };
+    if !matches!(dataset, Dataset::Bbo | Dataset::L2book) {
+        anyhow::bail!(
+            "--vpc-grpc-url (VPC_GRPC_URL) is only supported for the bbo and l2book datasets, not {}",
+            dataset.label()
+        );
+    }
+    Ok(Some(streams::validate_vpc_grpc_endpoint(&url)?))
+}
+
+/// The decoded stream socket is a peering/mempool source, and it may never be the same wire as a
+/// dialed peering endpoint or the reference feed: one socket is scored once, under one name.
+fn validate_vpc_decoded_socket(
+    dataset: Dataset,
+    socket: Option<String>,
+    peering_endpoints: &[(Provider, String)],
+    peering_reference: &str,
+) -> Result<Option<String>> {
+    let Some(socket) = socket else {
+        return Ok(None);
+    };
+    if !matches!(dataset, Dataset::Peering | Dataset::Mempool) {
+        anyhow::bail!(
+            "--vpc-decoded-socket (VPC_DECODED_SOCKET) is only supported for the peering and mempool datasets, not {}",
+            dataset.label()
+        );
+    }
+    peering::validate_peering_endpoint(&socket, "decoded stream socket")?;
+    if peering_endpoints
+        .iter()
+        .any(|(_, endpoint)| *endpoint == socket)
+        || peering_reference == socket
+    {
+        anyhow::bail!(
+            "--vpc-decoded-socket {socket} is already dialed as a peering endpoint or the reference feed; one wire is never scored twice"
+        );
+    }
+    Ok(Some(socket))
+}
+
 fn infer_location(runner: &str) -> (Option<String>, Option<String>, Option<String>) {
     let parts = runner
         .split(['-', '.'])
@@ -518,7 +627,7 @@ fn infer_location(runner: &str) -> (Option<String>, Option<String>, Option<Strin
         .collect::<Vec<_>>();
     let cloud = parts
         .iter()
-        .find(|part| matches!(part.as_str(), "aws" | "gcp" | "oracle"))
+        .find(|part| matches!(part.as_str(), "aws" | "gcp" | "oracle" | "vpc"))
         .cloned();
     let region = parts.iter().find_map(|part| match part.as_str() {
         "iad" | "fra" | "nrt" | "sin" => Some(part.clone()),
@@ -652,6 +761,77 @@ mod tests {
     }
 
     #[test]
+    fn vpc_decoded_socket_is_peering_only_and_never_a_dialed_wire() {
+        let dialed = vec![(
+            Provider::QuickNodePeeringTcp,
+            "203.0.113.10:4001".to_owned(),
+        )];
+        let reference = "203.0.113.20:9464";
+        assert!(
+            validate_vpc_decoded_socket(Dataset::Peering, None, &dialed, reference)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            validate_vpc_decoded_socket(
+                Dataset::Peering,
+                Some("203.0.113.10:4011".to_owned()),
+                &dialed,
+                reference
+            )
+            .unwrap(),
+            Some("203.0.113.10:4011".to_owned())
+        );
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Fills,
+                Some("203.0.113.10:4011".to_owned()),
+                &dialed,
+                reference
+            )
+            .is_err()
+        );
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Mempool,
+                Some("203.0.113.10:4011".to_owned()),
+                &[],
+                ""
+            )
+            .is_ok()
+        );
+        // The sentry's gossip serve and its decoded socket are different wires; the same
+        // address twice would score one wire under two names.
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Peering,
+                Some("203.0.113.10:4001".to_owned()),
+                &dialed,
+                reference
+            )
+            .is_err()
+        );
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Peering,
+                Some(reference.to_owned()),
+                &dialed,
+                reference
+            )
+            .is_err()
+        );
+        assert!(
+            validate_vpc_decoded_socket(
+                Dataset::Peering,
+                Some("tcp://x.test:4011".to_owned()),
+                &dialed,
+                reference
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn mempool_v1_contract_is_explicitly_btc_only() {
         assert!(validate_dataset_coins(Dataset::Mempool, &["BTC".to_owned()]).is_ok());
         assert!(validate_dataset_coins(Dataset::Mempool, &["ETH".to_owned()]).is_err());
@@ -760,5 +940,57 @@ mod tests {
             .unwrap();
 
         assert!(config.max_rolling_cohorts >= required_rolling);
+    }
+    #[test]
+    fn vpc_grpc_url_is_books_only_and_loopback() {
+        assert!(validate_vpc_grpc(Dataset::Bbo, None).unwrap().is_none());
+        assert_eq!(
+            validate_vpc_grpc(Dataset::Bbo, Some("http://127.0.0.1:10000".to_owned())).unwrap(),
+            Some("http://127.0.0.1:10000".to_owned())
+        );
+        assert!(
+            validate_vpc_grpc(Dataset::L2book, Some("http://localhost:10000".to_owned())).is_ok()
+        );
+        assert!(
+            validate_vpc_grpc(Dataset::Fills, Some("http://127.0.0.1:10000".to_owned())).is_err()
+        );
+        assert!(
+            validate_vpc_grpc(Dataset::Mempool, Some("http://127.0.0.1:10000".to_owned())).is_err()
+        );
+        assert!(
+            validate_vpc_grpc(
+                Dataset::Bbo,
+                Some("https://example-guide-demo.hype-mainnet.quiknode.pro:10000".to_owned())
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn vpc_node_data_is_fills_only_and_must_hold_a_fills_tree() {
+        let root = std::env::temp_dir().join(format!("vpc-node-data-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            validate_vpc_node_data(Dataset::Fills, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(validate_vpc_node_data(Dataset::Mempool, Some(root.clone())).is_err());
+        assert!(validate_vpc_node_data(Dataset::Fills, Some(root.clone())).is_err());
+        std::fs::create_dir_all(root.join("node_fills_by_block").join("hourly")).unwrap();
+        assert_eq!(
+            validate_vpc_node_data(Dataset::Fills, Some(root.clone())).unwrap(),
+            Some(root.clone())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(validate_public_identity("vpc-nrt-01", "vpc", "nrt", "nrt").is_ok());
+        assert_eq!(
+            infer_location("vpc-nrt-01"),
+            (
+                Some("vpc".to_owned()),
+                Some("nrt".to_owned()),
+                Some("nrt".to_owned())
+            )
+        );
     }
 }

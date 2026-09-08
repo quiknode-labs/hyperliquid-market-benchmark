@@ -6,25 +6,65 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use clap::ValueEnum;
 use tokio::sync::mpsc;
 
-pub const PROVIDERS: [Provider; 5] = [
+pub const PROVIDERS: [Provider; 6] = [
     Provider::FoundationWs,
     Provider::HydromancerWs,
     Provider::QuickNodeGrpc,
     Provider::QuickNodePeeringTcp,
     Provider::HydromancerPeeringTcp,
+    Provider::QuickNodeVpc,
 ];
 pub const BOOK_PROVIDERS: [Provider; 3] = [
     Provider::FoundationWs,
     Provider::HydromancerWs,
     Provider::QuickNodeGrpc,
 ];
+/// Books (bbo, l2book) on the Quicknode VPC box: the collector reads the box's own Quicknode gRPC
+/// service — raptor-grpc beside the node, fed through the shared-memory write hook — over loopback
+/// as the single `quicknode-vpc` source. Same event-timestamp reference and canonical-book-ready
+/// boundary as the fleet's Quicknode gRPC leg, one sample per event; no network feed is dialed
+/// from the box. The comparison with the network paths is drawn on the dashboard.
+pub const BOOK_VPC_PROVIDERS: [Provider; 1] = [Provider::QuickNodeVpc];
+pub const BOOK_VPC_COHORT: &str = "quicknode-vpc";
+pub const BBO_VPC_MEASUREMENT_VERSION: &str = "bbo-vpc-grpc-v1";
+pub const L2BOOK_VPC_MEASUREMENT_VERSION: &str = "l2book-vpc-grpc-v1";
 pub const FILLS_PROVIDERS: [Provider; 2] = [Provider::FoundationWs, Provider::QuickNodeGrpc];
+/// Fills on the Quicknode VPC box: the collector runs on the box and reads only that box's own
+/// node output (`node_fills_by_block`). No network feed is dialed from the box — the product is
+/// the node beside the sentry, so its fills are recorded where they land and scored on their own,
+/// from the fill's own timestamp, one sample per trade. Comparison against the network paths
+/// happens on the dashboard, which draws this leg beside any observer's cohort.
+pub const FILLS_VPC_PROVIDERS: [Provider; 1] = [Provider::QuickNodeVpc];
+pub const FILLS_VPC_COHORT: &str = "quicknode-vpc";
+pub const FILLS_VPC_MEASUREMENT_VERSION: &str = "fills-vpc-node-v1";
 pub const MEMPOOL_PROVIDERS: [Provider; 1] = [Provider::QuickNodeGrpc];
+/// Mempool with the Quicknode VPC source: the collector on the VPC box reads the co-located sentry's
+/// `bundle` lines beside the Quicknode gRPC mempool stream; both legs share one reference per bundle
+/// (the box's first sight of it), so the endpoint and the box are one exact cohort per tx hash.
+pub const MEMPOOL_VPC_PROVIDERS: [Provider; 2] = [Provider::QuickNodeGrpc, Provider::QuickNodeVpc];
+pub const MEMPOOL_VPC_COHORT: &str = "quicknode-grpc+quicknode-vpc";
+/// Metric of the VPC mempool cohort: the box's first sight of a bundle (sentry receipt, or an
+/// earlier arrival of the same bundle at this process) → each leg's decoded, validated bundle.
+pub const MEMPOOL_VPC_METRIC_KIND: &str = "box_first_seen_to_bundle_ready";
+pub const MEMPOOL_VPC_MEASUREMENT_VERSION: &str = "mempool-box-first-seen-v1";
 pub const PEERING_PROVIDERS: [Provider; 1] = [Provider::QuickNodePeeringTcp];
 pub const HYDROMANCER_PEERING_PROVIDERS: [Provider; 1] = [Provider::HydromancerPeeringTcp];
 pub const PEERING_COMPARISON_PROVIDERS: [Provider; 2] = [
     Provider::QuickNodePeeringTcp,
     Provider::HydromancerPeeringTcp,
+];
+/// Peering with the Quicknode VPC source: the collector runs on the VPC box and reads the
+/// co-located sentry's decoded stream socket beside the peering service(s) it dials, so the
+/// sentry's pre-confirmation `block` line is scored in the same per-round cohort as block-ready
+/// on the gossip wire. One extra leg per mode; the dialed services are unchanged.
+pub const PEERING_VPC_PROVIDERS: [Provider; 2] =
+    [Provider::QuickNodePeeringTcp, Provider::QuickNodeVpc];
+pub const HYDROMANCER_PEERING_VPC_PROVIDERS: [Provider; 2] =
+    [Provider::HydromancerPeeringTcp, Provider::QuickNodeVpc];
+pub const PEERING_COMPARISON_VPC_PROVIDERS: [Provider; 3] = [
+    Provider::QuickNodePeeringTcp,
+    Provider::HydromancerPeeringTcp,
+    Provider::QuickNodeVpc,
 ];
 
 /// Which peering service(s) one `peering` process dials. `Comparison` dials
@@ -52,6 +92,25 @@ impl PeeringMode {
             Self::Quicknode => "quicknode-peering-tcp",
             Self::Hydromancer => "hydromancer-peering-tcp",
             Self::Comparison => "quicknode-peering-tcp+hydromancer-peering-tcp",
+        }
+    }
+
+    /// The same mode with the Quicknode VPC leg added (collector on the VPC box reading the
+    /// co-located sentry's decoded stream). Every VPC cohort has at least two sources, so it
+    /// always carries a fastest-provider share.
+    pub const fn vpc_providers(self) -> &'static [Provider] {
+        match self {
+            Self::Quicknode => &PEERING_VPC_PROVIDERS,
+            Self::Hydromancer => &HYDROMANCER_PEERING_VPC_PROVIDERS,
+            Self::Comparison => &PEERING_COMPARISON_VPC_PROVIDERS,
+        }
+    }
+
+    pub const fn vpc_cohort(self) -> &'static str {
+        match self {
+            Self::Quicknode => "quicknode-peering-tcp+quicknode-vpc",
+            Self::Hydromancer => "hydromancer-peering-tcp+quicknode-vpc",
+            Self::Comparison => "quicknode-peering-tcp+hydromancer-peering-tcp+quicknode-vpc",
         }
     }
 
@@ -165,6 +224,12 @@ pub enum Provider {
     QuickNodeGrpc,
     QuickNodePeeringTcp,
     HydromancerPeeringTcp,
+    /// The Quicknode VPC product read on the box that runs it: a Hyperliquid node fed by a
+    /// co-located Quicknode sentry, observed through the node's own output files (fills), the
+    /// sentry's decoded stream socket (peering, mempool) or the box's own Quicknode gRPC service
+    /// over loopback (bbo, l2book). Only a collector running on that box can stamp this provider;
+    /// it never appears from a network observer.
+    QuickNodeVpc,
 }
 
 impl Provider {
@@ -175,6 +240,7 @@ impl Provider {
             Self::QuickNodeGrpc => 2,
             Self::QuickNodePeeringTcp => 3,
             Self::HydromancerPeeringTcp => 4,
+            Self::QuickNodeVpc => 5,
         }
     }
 
@@ -185,6 +251,7 @@ impl Provider {
             Self::QuickNodeGrpc => "quicknode-grpc",
             Self::QuickNodePeeringTcp => "quicknode-peering",
             Self::HydromancerPeeringTcp => "hydromancer-peering",
+            Self::QuickNodeVpc => "quicknode-vpc",
         }
     }
 
@@ -193,6 +260,7 @@ impl Provider {
             Self::FoundationWs | Self::HydromancerWs => "ws",
             Self::QuickNodeGrpc => "grpc",
             Self::QuickNodePeeringTcp | Self::HydromancerPeeringTcp => "tcp",
+            Self::QuickNodeVpc => "local",
         }
     }
 }

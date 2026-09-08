@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -51,12 +52,32 @@ pub struct StreamConfig {
     /// rows. Ignored by every other dataset.
     pub peering_endpoints: Vec<(Provider, String)>,
     pub peering_reference: String,
+    /// `hl/data` of the Hyperliquid node on THIS box (the Quicknode VPC product). When set for
+    /// the fills dataset, the node's own `node_fills_by_block` output is the only source: the
+    /// same per-user fill pairs the Quicknode gRPC feed carries, reconstructed with the same
+    /// rule, stamped when the line becomes readable here. No network feed is dialed.
+    pub vpc_node_data: Option<std::path::PathBuf>,
+    /// `host:port` of the co-located Quicknode sentry's decoded stream on THIS box. Peering: each
+    /// `block` line is scored as the `quicknode-vpc` provider in the same per-round cohort as the
+    /// dialed peering service(s). Mempool: each `bundle` line is the `quicknode-vpc` leg and the
+    /// Quicknode gRPC leg is re-referenced to the box's first sight of the same bundle.
+    pub vpc_decoded_socket: Option<String>,
+    /// Loopback origin of the Quicknode gRPC service running on THIS box (raptor-grpc beside the
+    /// node, e.g. `http://127.0.0.1:10000`). Books only (bbo, l2book): the box's own service is
+    /// the single `quicknode-vpc` source, read through the same client, subscription and
+    /// canonical-book construction as the fleet's Quicknode gRPC leg, with no token (there is no
+    /// edge in front of it). No network feed is dialed.
+    pub vpc_grpc: Option<String>,
 }
 
 pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandle<()>> {
     let mut tasks = Vec::with_capacity(config.coins.len() * config.dataset.providers().len());
+    let vpc_node_only = config.dataset == Dataset::Fills && config.vpc_node_data.is_some();
+    let vpc_grpc_only =
+        matches!(config.dataset, Dataset::Bbo | Dataset::L2book) && config.vpc_grpc.is_some();
+    let vpc_only = vpc_node_only || vpc_grpc_only;
     for coin in config.coins.clone() {
-        if config.dataset.providers().contains(&Provider::FoundationWs) {
+        if config.dataset.providers().contains(&Provider::FoundationWs) && !vpc_only {
             tasks.push(tokio::spawn(run_foundation(
                 config.foundation_ws.clone(),
                 coin.clone(),
@@ -68,6 +89,7 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
             .dataset
             .providers()
             .contains(&Provider::HydromancerWs)
+            && !vpc_only
         {
             tasks.push(tokio::spawn(run_hydromancer(
                 config.hydromancer_ws.clone(),
@@ -77,16 +99,55 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
                 sender.clone(),
             )));
         }
+        let mempool_join = match (config.dataset, &config.vpc_decoded_socket) {
+            (Dataset::Mempool, Some(socket)) => {
+                let (join_tx, join_rx) = mpsc::channel(crate::vpc_mempool::JOIN_QUEUE);
+                tasks.push(tokio::spawn(crate::vpc_mempool::run_join(
+                    join_rx,
+                    coin.clone(),
+                    sender.clone(),
+                )));
+                tasks.push(tokio::spawn(crate::vpc_mempool::run_bundle_lines(
+                    socket.clone(),
+                    coin.clone(),
+                    sender.clone(),
+                    join_tx.clone(),
+                )));
+                Some(join_tx)
+            }
+            _ => None,
+        };
         if config
             .dataset
             .providers()
             .contains(&Provider::QuickNodeGrpc)
+            && !vpc_only
         {
             tasks.push(tokio::spawn(run_quicknode(
+                Provider::QuickNodeGrpc,
                 config.quicknode_grpc.clone(),
-                config.quicknode_token.clone(),
+                Some(config.quicknode_token.clone()),
                 coin.clone(),
                 config.dataset,
+                sender.clone(),
+                mempool_join,
+            )));
+        }
+        if let (Dataset::Bbo | Dataset::L2book, Some(url)) = (config.dataset, &config.vpc_grpc) {
+            tasks.push(tokio::spawn(run_quicknode(
+                Provider::QuickNodeVpc,
+                url.clone(),
+                None,
+                coin.clone(),
+                config.dataset,
+                sender.clone(),
+                None,
+            )));
+        }
+        if let (Dataset::Fills, Some(dir)) = (config.dataset, &config.vpc_node_data) {
+            tasks.push(tokio::spawn(run_vpc_fills(
+                dir.join("node_fills_by_block").join("hourly"),
+                coin.clone(),
                 sender.clone(),
             )));
         }
@@ -95,6 +156,14 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
                 tasks.push(tokio::spawn(crate::peering::run_peering(
                     *provider,
                     endpoint.clone(),
+                    config.peering_reference.clone(),
+                    coin.clone(),
+                    sender.clone(),
+                )));
+            }
+            if let Some(socket) = &config.vpc_decoded_socket {
+                tasks.push(tokio::spawn(crate::peering::run_vpc_decoded(
+                    socket.clone(),
                     config.peering_reference.clone(),
                     coin.clone(),
                     sender.clone(),
@@ -174,39 +243,52 @@ async fn run_hydromancer(
     }
 }
 
+/// The Quicknode gRPC client, stamped as `provider`: the public endpoint (`QuickNodeGrpc`, with
+/// the tenant token) or the box's own service over loopback (`QuickNodeVpc`, no token).
 async fn run_quicknode(
+    provider: Provider,
     endpoint: String,
-    token: String,
+    token: Option<String>,
     coin: String,
     dataset: Dataset,
     sender: ProbeSender,
+    mempool_join: Option<mpsc::Sender<crate::vpc_mempool::JoinInput>>,
 ) {
     let mut backoff = ReconnectBackoff::default();
     loop {
         let generation = sender
-            .stream_snapshot(Provider::QuickNodeGrpc, &coin)
+            .stream_snapshot(provider, &coin)
             .connection_generation;
-        match run_quicknode_once(&endpoint, &token, &coin, dataset, &sender).await {
-            Ok(()) => warn!(%coin, dataset = dataset.label(), "Quicknode gRPC stream ended"),
+        match run_quicknode_once(
+            provider,
+            &endpoint,
+            token.as_deref(),
+            &coin,
+            dataset,
+            &sender,
+            mempool_join.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => {
+                warn!(%coin, dataset = dataset.label(), provider = provider.name(), "Quicknode gRPC stream ended")
+            }
             Err(error) => {
-                warn!(%coin, dataset = dataset.label(), ?error, "Quicknode gRPC stream disconnected")
+                warn!(%coin, dataset = dataset.label(), provider = provider.name(), ?error, "Quicknode gRPC stream disconnected")
             }
         }
         if !sender
             .send(ProbeEvent::Reconnect {
-                provider: Provider::QuickNodeGrpc,
+                provider,
                 coin: coin.clone(),
             })
             .await
         {
             return;
         }
-        tokio::time::sleep(backoff.after_connection(connection_duration(
-            &sender,
-            Provider::QuickNodeGrpc,
-            &coin,
-            generation,
-        )))
+        tokio::time::sleep(
+            backoff.after_connection(connection_duration(&sender, provider, &coin, generation)),
+        )
         .await;
     }
 }
@@ -488,13 +570,15 @@ async fn run_hydromancer_once(
 }
 
 async fn run_quicknode_once(
+    provider: Provider,
     endpoint: &str,
-    token: &str,
+    token: Option<&str>,
     coin: &str,
     dataset: Dataset,
     sender: &ProbeSender,
+    mempool_join: Option<&mpsc::Sender<crate::vpc_mempool::JoinInput>>,
 ) -> Result<()> {
-    let channel = grpc_channel(endpoint).await?;
+    let channel = grpc_channel(provider, endpoint).await?;
     let mut client = OrderBookStreamingClient::new(channel.clone())
         .max_decoding_message_size(MAX_GRPC_MESSAGE_BYTES)
         .max_encoding_message_size(64 * 1024);
@@ -505,11 +589,13 @@ async fn run_quicknode_once(
             let mut request = tonic::Request::new(BboBookRequest {
                 coins: vec![coin.to_owned()],
             });
-            request
-                .metadata_mut()
-                .insert("x-token", MetadataValue::try_from(token)?);
+            if let Some(token) = token {
+                request
+                    .metadata_mut()
+                    .insert("x-token", MetadataValue::try_from(token)?);
+            }
             let mut stream = client.stream_bbo_book(request).await?.into_inner();
-            let _connection = sender.connected(Provider::QuickNodeGrpc, coin);
+            let _connection = sender.connected(provider, coin);
             loop {
                 let update = tokio::time::timeout(WS_READ_TIMEOUT, stream.message())
                     .await
@@ -544,7 +630,7 @@ async fn run_quicknode_once(
                 let received_wall_ms = now_ms();
                 if !sender
                     .send(ProbeEvent::Market(MarketEvent {
-                        provider: Provider::QuickNodeGrpc,
+                        provider,
                         key,
                         received,
                         received_wall_ms,
@@ -562,11 +648,13 @@ async fn run_quicknode_once(
                 n_sig_figs: None,
                 mantissa: None,
             });
-            request
-                .metadata_mut()
-                .insert("x-token", MetadataValue::try_from(token)?);
+            if let Some(token) = token {
+                request
+                    .metadata_mut()
+                    .insert("x-token", MetadataValue::try_from(token)?);
+            }
             let mut stream = client.stream_l2_book(request).await?.into_inner();
-            let _connection = sender.connected(Provider::QuickNodeGrpc, coin);
+            let _connection = sender.connected(provider, coin);
             loop {
                 let update = tokio::time::timeout(WS_READ_TIMEOUT, stream.message())
                     .await
@@ -609,7 +697,7 @@ async fn run_quicknode_once(
                 let received_wall_ms = now_ms();
                 if !sender
                     .send(ProbeEvent::Market(MarketEvent {
-                        provider: Provider::QuickNodeGrpc,
+                        provider,
                         key,
                         received,
                         received_wall_ms,
@@ -635,11 +723,13 @@ async fn run_quicknode_once(
                 .await
                 .with_context(|| format!("queue Quicknode {} subscription", dataset.label()))?;
             let mut request = tonic::Request::new(ReceiverStream::new(request_rx));
-            request
-                .metadata_mut()
-                .insert("x-token", MetadataValue::try_from(token)?);
+            if let Some(token) = token {
+                request
+                    .metadata_mut()
+                    .insert("x-token", MetadataValue::try_from(token)?);
+            }
             let mut stream = client.stream_data(request).await?.into_inner();
-            let _connection = sender.connected(Provider::QuickNodeGrpc, coin);
+            let _connection = sender.connected(provider, coin);
             let mut heartbeat = heartbeat_interval();
             let mut last_frame = Instant::now();
 
@@ -682,9 +772,27 @@ async fn run_quicknode_once(
                             if key.coin != coin {
                                 continue;
                             }
+                            // On the VPC box the mempool leg is scored against the box's first
+                            // sight of the bundle, so it goes through the join instead.
+                            if let (Some(join), ContentKey::Mempool { tx_hash }) =
+                                (mempool_join, &key.content)
+                            {
+                                if join
+                                    .send(crate::vpc_mempool::JoinInput::Grpc {
+                                        tx_hash: tx_hash.clone(),
+                                        received,
+                                        received_wall_ms,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return Ok(());
+                                }
+                                continue;
+                            }
                             if !sender
                                 .send(ProbeEvent::Market(MarketEvent {
-                                    provider: Provider::QuickNodeGrpc,
+                                    provider,
                                     key,
                                     received,
                                     received_wall_ms,
@@ -752,8 +860,11 @@ fn read_deadline_exceeded(last_frame: Instant, now: Instant) -> bool {
     now.saturating_duration_since(last_frame) >= WS_READ_TIMEOUT
 }
 
-async fn grpc_channel(endpoint: &str) -> Result<Channel> {
-    let normalized = validate_grpc_endpoint(endpoint)?;
+async fn grpc_channel(provider: Provider, endpoint: &str) -> Result<Channel> {
+    let normalized = match provider {
+        Provider::QuickNodeVpc => validate_vpc_grpc_endpoint(endpoint)?,
+        _ => validate_grpc_endpoint(endpoint)?,
+    };
     let endpoint = Endpoint::from_shared(normalized.clone())?
         .tcp_nodelay(true)
         .http2_keep_alive_interval(Duration::from_secs(10))
@@ -813,6 +924,33 @@ fn validate_grpc_endpoint(endpoint: &str) -> Result<String> {
         );
     }
     Ok(normalized)
+}
+
+/// The box's own Quicknode gRPC service is reached over loopback and plaintext: it has no edge in
+/// front of it, so there is nothing to authenticate against and TLS would only cost. Anything
+/// that is not a loopback `http://` origin with an explicit port is refused, so a public endpoint
+/// can never be mislabelled as the box's own.
+pub(crate) fn validate_vpc_grpc_endpoint(endpoint: &str) -> Result<String> {
+    let url = url::Url::parse(endpoint).context("invalid VPC gRPC endpoint")?;
+    if url.scheme() != "http" {
+        anyhow::bail!("VPC gRPC endpoint must be a plaintext http:// loopback origin");
+    }
+    let host = url
+        .host_str()
+        .context("VPC gRPC endpoint must name a loopback host")?;
+    if !is_loopback_host(host.trim_matches(['[', ']'])) {
+        anyhow::bail!("VPC gRPC endpoint must be on this box (127.0.0.1, ::1 or localhost)");
+    }
+    if url.port().is_none() {
+        anyhow::bail!("VPC gRPC endpoint must carry an explicit port");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        anyhow::bail!("VPC gRPC endpoint must not contain credentials");
+    }
+    if url.query().is_some() || url.fragment().is_some() || !matches!(url.path(), "" | "/") {
+        anyhow::bail!("VPC gRPC endpoint must be an origin without a path, query, or fragment");
+    }
+    Ok(endpoint.trim_end_matches('/').to_owned())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1158,6 +1296,133 @@ fn parse_quicknode_fill_batch(payload: &str) -> Vec<EventKey> {
         .collect()
 }
 
+/// The Quicknode VPC fills source: follow the newest file of the node's
+/// `node_fills_by_block/hourly/<date>/<hour>` tree from its end and turn every new line into
+/// canonical trades exactly as the Quicknode gRPC fill batches are (`parse_quicknode_fill_batch`
+/// reads the same `{"events": [[user, fill], …]}` shape; the file's extra `local_time`,
+/// `block_time`, `block_number` keys are ignored). Ready = the line is readable and the trade
+/// reconstructed, stamped with this process's clock, so it is the same boundary as the gRPC
+/// path measured by the same process. Only lines written after start are timed.
+async fn run_vpc_fills(hourly_root: PathBuf, coin: String, sender: ProbeSender) {
+    let mut backoff = ReconnectBackoff::default();
+    loop {
+        let started = Instant::now();
+        match run_vpc_fills_once(&hourly_root, &coin, &sender).await {
+            Ok(()) => return,
+            Err(error) => warn!(%coin, ?error, "vpc fills tail failed"),
+        }
+        if !sender
+            .send(ProbeEvent::Reconnect {
+                provider: Provider::QuickNodeVpc,
+                coin: coin.clone(),
+            })
+            .await
+        {
+            return;
+        }
+        tokio::time::sleep(backoff.after_connection(started.elapsed())).await;
+    }
+}
+
+/// Newest `<root>/<date>/<hour>` file: dates are `YYYYMMDD` (name order is time order); hour
+/// file names are NOT zero-padded by hl-node (`0`…`23`), so they are ordered numerically, with
+/// name order only as the fallback for anything that is not a number.
+fn newest_hourly_file(root: &Path) -> Option<PathBuf> {
+    fn hour_key(path: &Path) -> (u32, String) {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        (name.parse::<u32>().unwrap_or(0), name.to_owned())
+    }
+    let mut days: Vec<_> = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.is_dir())
+        .collect();
+    days.sort();
+    for day in days.into_iter().rev() {
+        let mut hours: Vec<_> = std::fs::read_dir(&day)
+            .ok()?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_file())
+            .collect();
+        hours.sort_by_key(|path| hour_key(path));
+        if let Some(newest) = hours.pop() {
+            return Some(newest);
+        }
+    }
+    None
+}
+
+const VPC_TAIL_POLL: Duration = Duration::from_millis(2);
+const VPC_TAIL_RECHECK: Duration = Duration::from_secs(1);
+
+async fn run_vpc_fills_once(hourly_root: &Path, coin: &str, sender: &ProbeSender) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let mut path = newest_hourly_file(hourly_root)
+        .context("no fills file under the node's hourly tree yet")?;
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .context("open node fills file")?;
+    file.seek(std::io::SeekFrom::End(0))
+        .await
+        .context("seek node fills file")?;
+    let _connection = sender.connected(Provider::QuickNodeVpc, coin);
+    let mut buf: Vec<u8> = Vec::with_capacity(1 << 20);
+    let mut chunk = vec![0u8; 256 * 1024];
+    let mut last_recheck = Instant::now();
+    loop {
+        let n = file
+            .read(&mut chunk)
+            .await
+            .context("read node fills file")?;
+        if n == 0 {
+            if last_recheck.elapsed() >= VPC_TAIL_RECHECK {
+                last_recheck = Instant::now();
+                if let Some(newest) =
+                    newest_hourly_file(hourly_root).filter(|newest| *newest != path)
+                {
+                    // The node rolled to a new hourly file; the old one is drained (n == 0).
+                    path = newest;
+                    file = tokio::fs::File::open(&path)
+                        .await
+                        .context("open rolled fills file")?;
+                    buf.clear();
+                    continue;
+                }
+            }
+            tokio::time::sleep(VPC_TAIL_POLL).await;
+            continue;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        let received = Instant::now();
+        let received_wall_ms = now_ms();
+        while let Some(newline) = buf.iter().position(|byte| *byte == b'\n') {
+            let line: Vec<u8> = buf.drain(..=newline).collect();
+            let Ok(text) = std::str::from_utf8(&line) else {
+                continue;
+            };
+            for key in parse_quicknode_fill_batch(text) {
+                if key.coin != coin {
+                    continue;
+                }
+                if !sender
+                    .send(ProbeEvent::Market(MarketEvent {
+                        provider: Provider::QuickNodeVpc,
+                        key,
+                        received,
+                        received_wall_ms,
+                    }))
+                    .await
+                {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
 fn parse_quicknode_mempool_bundle(payload: &str, coin: &str) -> Option<EventKey> {
     let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
     let (timestamp, transaction) = if let Some(tuple) = value.as_array() {
@@ -1194,14 +1459,17 @@ fn parse_quicknode_mempool_bundle(payload: &str, coin: &str) -> Option<EventKey>
     })
 }
 
-fn mempool_asset_id(coin: &str) -> Option<u64> {
+pub(crate) fn mempool_asset_id(coin: &str) -> Option<u64> {
     match coin {
         "BTC" => Some(0),
         _ => None,
     }
 }
 
-fn mempool_action_matches_asset(action: Option<&serde_json::Value>, expected: u64) -> bool {
+pub(crate) fn mempool_action_matches_asset(
+    action: Option<&serde_json::Value>,
+    expected: u64,
+) -> bool {
     let Some(action) = action else {
         return false;
     };
@@ -1253,7 +1521,7 @@ fn mempool_direct_asset_matches(value: Option<&serde_json::Value>, expected: u64
         })
 }
 
-fn valid_mempool_tx_hash(tx_hash: &str) -> bool {
+pub(crate) fn valid_mempool_tx_hash(tx_hash: &str) -> bool {
     tx_hash.strip_prefix("0x").is_some_and(|hex| {
         !hex.is_empty() && hex.len() <= 128 && hex.bytes().all(|b| b.is_ascii_hexdigit())
     })
@@ -1735,6 +2003,30 @@ mod tests {
     }
 
     #[test]
+    fn vpc_grpc_endpoint_is_a_plaintext_loopback_origin() {
+        assert_eq!(
+            validate_vpc_grpc_endpoint("http://127.0.0.1:10000").unwrap(),
+            "http://127.0.0.1:10000"
+        );
+        assert_eq!(
+            validate_vpc_grpc_endpoint("http://localhost:10000/").unwrap(),
+            "http://localhost:10000"
+        );
+        assert!(validate_vpc_grpc_endpoint("http://[::1]:10000").is_ok());
+        // Not this box, not plaintext, no port, credentials, a path: all refused.
+        assert!(validate_vpc_grpc_endpoint("http://10.0.0.5:10000").is_err());
+        assert!(
+            validate_vpc_grpc_endpoint("http://example-guide-demo.hype-mainnet.quiknode.pro:10000")
+                .is_err()
+        );
+        assert!(validate_vpc_grpc_endpoint("https://127.0.0.1:10000").is_err());
+        assert!(validate_vpc_grpc_endpoint("http://127.0.0.1").is_err());
+        assert!(validate_vpc_grpc_endpoint("http://user:secret@127.0.0.1:10000").is_err());
+        assert!(validate_vpc_grpc_endpoint("http://127.0.0.1:10000/info").is_err());
+        assert!(validate_vpc_grpc_endpoint("127.0.0.1:10000").is_err());
+    }
+
+    #[test]
     fn public_endpoint_requires_websocket_scheme() {
         assert!(validate_public_ws_endpoint("https://example.com/ws", "Foundation").is_err());
         assert!(validate_public_ws_endpoint("ws://example.com/ws", "Foundation").is_err());
@@ -1747,7 +2039,7 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_grpc_rejects_plaintext_remote_endpoints() {
-        let error = grpc_channel("http://example.com:10000")
+        let error = grpc_channel(Provider::QuickNodeGrpc, "http://example.com:10000")
             .await
             .expect_err("remote plaintext must be rejected");
         assert!(error.to_string().contains("must use HTTPS"));
@@ -1758,5 +2050,52 @@ mod tests {
         let config = websocket_config();
         assert_eq!(config.max_message_size, Some(MAX_WS_MESSAGE_BYTES));
         assert_eq!(config.max_frame_size, Some(MAX_WS_MESSAGE_BYTES));
+    }
+    #[test]
+    fn vpc_fills_file_line_reconstructs_the_same_trade_as_the_grpc_batch() {
+        // One line of node_fills_by_block: the node's own write stamp and block fields ride along;
+        // the events array is the shape the Quicknode gRPC TRADES batch carries.
+        let line = r#"{"local_time":"2026-09-06T15:26:59.018944563","block_time":"2026-09-06T15:26:58.862638705","block_number":1137300000,"events":[["0xbuyer",{"coin":"BTC","px":"64000.0","sz":"0.01","side":"B","time":1788708418862,"startPosition":"0.0","dir":"Open Long","closedPnl":"0.0","hash":"0xABC","oid":1,"crossed":true,"fee":"0.1","tid":77,"feeToken":"USDC","twapId":null}],["0xseller",{"coin":"BTC","px":"64000","sz":"0.010","side":"A","time":1788708418862,"startPosition":"0.0","dir":"Close Long","closedPnl":"0.0","hash":"0xabc","oid":2,"crossed":false,"fee":"0.0","tid":77,"feeToken":"USDC","twapId":null}]]}"#;
+        let trades = parse_quicknode_fill_batch(line);
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].coin, "BTC");
+        assert_eq!(trades[0].event_ms, 1788708418862);
+        assert_eq!(
+            trades[0].content,
+            ContentKey::Trade {
+                tid: 77,
+                side: "B".to_owned(),
+                px: "64000".to_owned(),
+                sz: "0.01".to_owned(),
+                hash: "0xabc".to_owned(),
+                users: ["0xbuyer".to_owned(), "0xseller".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn newest_hourly_file_orders_by_date_then_hour() {
+        let root = std::env::temp_dir().join(format!("vpc-fills-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // hl-node does not zero-pad hours: "9" must lose to "15" (text order says otherwise).
+        for (day, hour) in [
+            ("20260905", "23"),
+            ("20260906", "7"),
+            ("20260906", "9"),
+            ("20260906", "15"),
+        ] {
+            std::fs::create_dir_all(root.join(day)).unwrap();
+            std::fs::write(root.join(day).join(hour), b"").unwrap();
+        }
+        assert_eq!(
+            newest_hourly_file(&root),
+            Some(root.join("20260906").join("15"))
+        );
+        std::fs::write(root.join("20260906").join("23"), b"").unwrap();
+        assert_eq!(
+            newest_hourly_file(&root),
+            Some(root.join("20260906").join("23"))
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

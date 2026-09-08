@@ -34,7 +34,7 @@ consumer must not replace an omitted value with zero.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `provider` | enum | `quicknode`, `hyperliquid`, or `hydromancer`. |
+| `provider` | enum | `quicknode`, `hyperliquid`, or `hydromancer`. The Quicknode VPC leg is `quicknode` with `source` `quicknode-vpc` and `protocol` `local`; it exists only in rows from a collector running on the VPC box (`METHODOLOGY.md`, "The Quicknode VPC source"). |
 | `protocol` | enum | `grpc` for Quicknode; `ws` for Foundation and Hydromancer. |
 | `source` | enum | `quicknode-grpc`, `hyperliquid-ws`, or `hydromancer-ws`. |
 | `dataset` | enum | `bbo`, depth-20 `l2book`, executed-trade `fills`, or filtered-bundle `mempool`. |
@@ -48,7 +48,7 @@ consumer must not replace an omitted value with zero.
 | `window_end` | RFC 3339 string | End of the rolling distribution. |
 | `window_seconds` | integer | Rolling distribution duration; currently 300. |
 | `publish_interval_seconds` | integer | Nominal publication cadence; currently 30. |
-| `cohort` | string | Exact dataset-specific source set. Mempool uses the one-source value `quicknode-grpc`. |
+| `cohort` | string | Exact dataset-specific source set. Mempool uses the one-source value `quicknode-grpc`; on the Quicknode VPC box it is `quicknode-grpc+quicknode-vpc` with `metric_kind` `box_first_seen_to_bundle_ready` and `measurement_version` `mempool-box-first-seen-v1`. Fills on the box is the one-source cohort `quicknode-vpc` (`measurement_version` `fills-vpc-node-v1`, metric unchanged); so are the books on the box (`bbo-vpc-grpc-v1`, `l2book-vpc-grpc-v1`: the box's own Quicknode gRPC service over loopback) (`METHODOLOGY.md`, "The Quicknode VPC source"). |
 | `coverage_count_scope` | string | `rolling-window` for coverage counts. |
 | `health_count_scope` | string | `run-lifetime` for cumulative health counters. |
 
@@ -61,7 +61,10 @@ consumer must not replace an omitted value with zero.
   `hydromancer`/`hydromancer-peering` for the Hydromancer service.
 - `cohort` names the exact set of services one process dialed:
   `quicknode-peering-tcp`, `hydromancer-peering-tcp`, or, in comparison mode,
-  `quicknode-peering-tcp+hydromancer-peering-tcp`.
+  `quicknode-peering-tcp+hydromancer-peering-tcp`. On the Quicknode VPC box each of
+  these gains `+quicknode-vpc` (the co-located sentry's decoded stream, `provider`
+  `quicknode`, `source` `quicknode-vpc`, `protocol` `local`; `METHODOLOGY.md`, "The
+  Quicknode VPC source"), and the fastest/tie counts are always published.
 - `schema` is `hyperliquid-market-benchmark-v4` and `measurement_version` is
   `peering-block-ready-v1`.
 - `sequence_gaps` counts consensus rounds that failed to complete (ordering or
@@ -112,10 +115,12 @@ Mempool has no provider race. It emits `outcome_count_scope=not-applicable`,
 | `outcome_interval_duration_ms` | integer | Actual elapsed boundary span. |
 | `outcome_interval_complete` | boolean | Exact nominal duration after startup and all cohort-health gates passed. |
 | `outcome_complete_cohort_count` | integer | Complete exact cohorts committed in this interval. |
-| `outcome_quicknode_strict_fastest_count` | integer | Cohorts with Quicknode as the unique minimum absolute latency. |
+| `outcome_quicknode_strict_fastest_count` | integer | Cohorts with Quicknode (gRPC or peering, whichever the process dials) as the unique minimum absolute latency. |
+| `outcome_quicknode_vpc_strict_fastest_count` | integer | Cohorts with the Quicknode VPC leg as the unique minimum; zero unless the cohort contains `quicknode-vpc` and at least one other source (peering `quicknode-peering-tcp+quicknode-vpc` and its variants; mempool `quicknode-grpc+quicknode-vpc`). Fills and the books on the box are the one-source cohort `quicknode-vpc` and carry no fastest share. |
 | `outcome_foundation_strict_fastest_count` | integer | Cohorts with Foundation as the unique minimum. |
 | `outcome_hydromancer_strict_fastest_count` | integer | Cohorts with Hydromancer as the unique minimum. |
 | `outcome_tie_count` | integer | Cohorts whose minimum was shared by at least two paths. |
+| `outcome_quicknode_vpc_tied_fastest_count` | integer | Cohorts where the Quicknode VPC leg shared the minimum. |
 | `outcome_{source}_tied_fastest_count` | integer | For transparency, how often that active source participated in a tie. |
 
 For every valid interval:

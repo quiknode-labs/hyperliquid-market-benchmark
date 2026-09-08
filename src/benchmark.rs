@@ -7,8 +7,11 @@ use serde::Serialize;
 use crate::axiom::IngestHealthSnapshot;
 use crate::clock::ClockHealthSnapshot;
 use crate::model::{
-    BaseKey, ContentKey, Dataset, EventKey, MarketEvent, PROVIDERS, PeeringMode, ProbeEvent,
-    Provider, RuntimeSignals,
+    BBO_VPC_MEASUREMENT_VERSION, BOOK_VPC_COHORT, BOOK_VPC_PROVIDERS, BaseKey, ContentKey, Dataset,
+    EventKey, FILLS_VPC_COHORT, FILLS_VPC_MEASUREMENT_VERSION, FILLS_VPC_PROVIDERS,
+    L2BOOK_VPC_MEASUREMENT_VERSION, MEMPOOL_VPC_COHORT, MEMPOOL_VPC_MEASUREMENT_VERSION,
+    MEMPOOL_VPC_METRIC_KIND, MEMPOOL_VPC_PROVIDERS, MarketEvent, PROVIDERS, PeeringMode,
+    ProbeEvent, Provider, RuntimeSignals,
 };
 
 #[cfg(test)]
@@ -69,6 +72,12 @@ pub struct BenchmarkConfig {
     /// Which peering service(s) the peering dataset dials and stamps. Ignored
     /// by every other dataset, which keeps its static provider set.
     pub peering_mode: PeeringMode,
+    /// The collector runs on a Quicknode VPC box and reads a local surface of the product as the
+    /// `quicknode-vpc` provider: the node's own fills output (fills), the box's own Quicknode gRPC
+    /// service over loopback (bbo, l2book), the co-located sentry's decoded `block` lines
+    /// (peering) or its `bundle` lines (mempool). Fills and books become that one source alone;
+    /// peering and mempool gain a leg, and mempool also changes its reference (see `metric_kind`).
+    pub vpc_local: bool,
 }
 
 impl BenchmarkConfig {
@@ -100,6 +109,7 @@ impl BenchmarkConfig {
             max_settled,
             max_rolling_cohorts,
             peering_mode: PeeringMode::Quicknode,
+            vpc_local: false,
         }
     }
 }
@@ -107,14 +117,44 @@ impl BenchmarkConfig {
 impl BenchmarkConfig {
     pub fn providers(&self) -> &'static [Provider] {
         match self.dataset {
+            Dataset::Peering if self.vpc_local => self.peering_mode.vpc_providers(),
             Dataset::Peering => self.peering_mode.providers(),
+            Dataset::Fills if self.vpc_local => &FILLS_VPC_PROVIDERS,
+            Dataset::Bbo | Dataset::L2book if self.vpc_local => &BOOK_VPC_PROVIDERS,
+            Dataset::Mempool if self.vpc_local => &MEMPOOL_VPC_PROVIDERS,
             _ => self.dataset.providers(),
+        }
+    }
+
+    /// Mempool on the VPC box measures from the box's first sight of a bundle rather than from the
+    /// embedded first-seen timestamp of one node, so its rows carry their own metric kind and
+    /// measurement version. Every other dataset keeps its static names.
+    pub fn metric_kind(&self) -> &'static str {
+        match self.dataset {
+            Dataset::Mempool if self.vpc_local => MEMPOOL_VPC_METRIC_KIND,
+            _ => self.dataset.metric_kind(),
+        }
+    }
+
+    pub fn measurement_version(&self) -> &'static str {
+        match self.dataset {
+            Dataset::Mempool if self.vpc_local => MEMPOOL_VPC_MEASUREMENT_VERSION,
+            // Same metric (fill time → canonical-fill-ready), one source: the box's node.
+            Dataset::Fills if self.vpc_local => FILLS_VPC_MEASUREMENT_VERSION,
+            // Same metric (event time → canonical-book-ready), one source: the box's own gRPC.
+            Dataset::Bbo if self.vpc_local => BBO_VPC_MEASUREMENT_VERSION,
+            Dataset::L2book if self.vpc_local => L2BOOK_VPC_MEASUREMENT_VERSION,
+            _ => self.dataset.measurement_version(),
         }
     }
 
     pub fn cohort(&self) -> &'static str {
         match self.dataset {
+            Dataset::Peering if self.vpc_local => self.peering_mode.vpc_cohort(),
             Dataset::Peering => self.peering_mode.cohort(),
+            Dataset::Fills if self.vpc_local => FILLS_VPC_COHORT,
+            Dataset::Bbo | Dataset::L2book if self.vpc_local => BOOK_VPC_COHORT,
+            Dataset::Mempool if self.vpc_local => MEMPOOL_VPC_COHORT,
             _ => self.dataset.cohort(),
         }
     }
@@ -122,12 +162,22 @@ impl BenchmarkConfig {
     pub fn reference_provider(&self) -> Provider {
         match self.dataset {
             Dataset::Peering => self.peering_mode.reference_provider(),
+            // The node (fills) or the box's own gRPC (books) is the only source on the box, so it
+            // is its own reference set.
+            Dataset::Fills | Dataset::Bbo | Dataset::L2book if self.vpc_local => {
+                Provider::QuickNodeVpc
+            }
             _ => self.dataset.reference_provider(),
         }
     }
 
     pub fn has_provider_comparison(&self) -> bool {
         match self.dataset {
+            // The VPC leg always makes a peering or mempool cohort at least two sources wide.
+            Dataset::Peering | Dataset::Mempool if self.vpc_local => true,
+            // Fills on the box is the node alone, books are the box's own gRPC alone: no race,
+            // no fastest share.
+            Dataset::Fills | Dataset::Bbo | Dataset::L2book if self.vpc_local => false,
             Dataset::Peering => self.peering_mode.has_provider_comparison(),
             _ => self.dataset.has_provider_comparison(),
         }
@@ -140,7 +190,7 @@ impl BenchmarkConfig {
     /// delivers it is scored as missing rather than silently dropping the
     /// round. This is what keeps a two-service peering cohort symmetric.
     fn canonical_by_any_arrival(&self) -> bool {
-        self.dataset == Dataset::Peering
+        self.dataset == Dataset::Peering || (self.dataset == Dataset::Mempool && self.vpc_local)
     }
 }
 
@@ -307,9 +357,13 @@ pub struct LatencyWindowEvent {
     pub outcome_foundation_strict_fastest_count: u64,
     pub outcome_hydromancer_strict_fastest_count: u64,
     pub outcome_quicknode_strict_fastest_count: u64,
+    /// The VPC box's own node is a distinct path from the Quicknode gRPC feed inside one
+    /// cohort, so it is scored as its own column rather than folded into the Quicknode family.
+    pub outcome_quicknode_vpc_strict_fastest_count: u64,
     pub outcome_foundation_tied_fastest_count: u64,
     pub outcome_hydromancer_tied_fastest_count: u64,
     pub outcome_quicknode_tied_fastest_count: u64,
+    pub outcome_quicknode_vpc_tied_fastest_count: u64,
     pub outcome_tie_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p50_ms: Option<f64>,
@@ -630,9 +684,9 @@ impl Benchmark {
                     time: window_end.clone(),
                     schema: self.config.dataset.schema(),
                     event_type: EVENT_TYPE,
-                    metric_kind: self.config.dataset.metric_kind(),
+                    metric_kind: self.config.metric_kind(),
                     benchmark_version: env!("CARGO_PKG_VERSION"),
-                    measurement_version: self.config.dataset.measurement_version(),
+                    measurement_version: self.config.measurement_version(),
                     source_commit: SOURCE_COMMIT,
                     artifact_sha256: self.config.artifact_sha256.clone(),
                     event_id: format!(
@@ -640,7 +694,7 @@ impl Benchmark {
                         self.config.dataset.schema(),
                         self.config.run_id,
                         window_id,
-                        public_provider(provider)
+                        event_id_provider(provider)
                     ),
                     window_id: window_id.clone(),
                     window_end: window_end.clone(),
@@ -694,6 +748,8 @@ impl Benchmark {
                         &outcomes.strict_fastest,
                         QUICKNODE_FAMILY,
                     ),
+                    outcome_quicknode_vpc_strict_fastest_count: outcomes.strict_fastest
+                        [Provider::QuickNodeVpc.index()],
                     outcome_foundation_tied_fastest_count: outcomes.tied_fastest
                         [Provider::FoundationWs.index()],
                     outcome_hydromancer_tied_fastest_count: provider_family_total(
@@ -704,6 +760,8 @@ impl Benchmark {
                         &outcomes.tied_fastest,
                         QUICKNODE_FAMILY,
                     ),
+                    outcome_quicknode_vpc_tied_fastest_count: outcomes.tied_fastest
+                        [Provider::QuickNodeVpc.index()],
                     outcome_tie_count: outcomes.ties,
                     p50_ms: summary.map(|value| value.p50),
                     p95_ms: summary.map(|value| value.p95),
@@ -1247,6 +1305,18 @@ fn public_provider(provider: Provider) -> &'static str {
         Provider::QuickNodeGrpc => "quicknode",
         Provider::QuickNodePeeringTcp => "quicknode",
         Provider::HydromancerPeeringTcp => "hydromancer",
+        Provider::QuickNodeVpc => "quicknode",
+    }
+}
+
+/// The provider component of `event_id`. Historically the public provider company, which is
+/// unique per window everywhere except on the VPC box, where two Quicknode paths (gRPC and the
+/// box's own node) publish in one window; the VPC path takes its source name so the two rows
+/// never share an identity. Existing providers keep their ids byte-for-byte.
+fn event_id_provider(provider: Provider) -> &'static str {
+    match provider {
+        Provider::QuickNodeVpc => public_source(provider),
+        other => public_provider(other),
     }
 }
 
@@ -1257,6 +1327,7 @@ fn public_source(provider: Provider) -> &'static str {
         Provider::QuickNodeGrpc => "quicknode-grpc",
         Provider::QuickNodePeeringTcp => "quicknode-peering",
         Provider::HydromancerPeeringTcp => "hydromancer-peering",
+        Provider::QuickNodeVpc => "quicknode-vpc",
     }
 }
 
@@ -1600,7 +1671,7 @@ mod tests {
 
             let ring = &benchmark.windows["BTC"].cohorts;
             assert_eq!(ring.len(), 1);
-            assert_eq!(ring[0].latency_ms, [200, 300, 100, 0, 0]);
+            assert_eq!(ring[0].latency_ms, [200, 300, 100, 0, 0, 0]);
             for provider in BOOK_PROVIDERS {
                 assert_eq!(benchmark.counters["BTC"][provider.index()].matched, 1);
             }
@@ -1642,7 +1713,7 @@ mod tests {
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BTC"].cohorts[0].latency_ms,
-            [200, 0, 100, 0, 0]
+            [200, 0, 100, 0, 0, 0]
         );
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| {
@@ -1688,7 +1759,7 @@ mod tests {
         assert_eq!(benchmark.windows["BTC"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BTC"].cohorts[0].latency_ms,
-            [0, 0, 125, 0, 0]
+            [0, 0, 125, 0, 0, 0]
         );
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -1758,7 +1829,7 @@ mod tests {
         assert_eq!(benchmark.windows["BLOCKS"].cohorts.len(), 1);
         assert_eq!(
             benchmark.windows["BLOCKS"].cohorts[0].latency_ms,
-            [0, 0, 0, 150, 0]
+            [0, 0, 0, 150, 0, 0]
         );
         assert_eq!(events.len(), 1);
         let event = &events[0];
@@ -2026,7 +2097,7 @@ mod tests {
         for benchmark in [&late_then_early, &early_then_late] {
             let window = &benchmark.windows["BTC"];
             assert_eq!(window.cohorts.len(), 1);
-            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100, 0, 0]);
+            assert_eq!(window.cohorts[0].latency_ms, [100, 100, 100, 0, 0, 0]);
             assert_eq!(window.complete_cohorts, 1);
             assert_eq!(window.state_evictions, 0);
             assert_eq!(window.rolling_evictions, 0);
@@ -2777,6 +2848,136 @@ mod tests {
                 .iter()
                 .filter(|event| event.coin == "ETH")
                 .all(|event| event.window_id == "runner:bbo:ETH:30000")
+        );
+    }
+    #[test]
+    fn vpc_local_makes_fills_the_node_alone_and_widens_peering_and_mempool() {
+        let mut config = BenchmarkConfig::production(
+            Dataset::Fills,
+            vec!["BTC".to_owned()],
+            "vpc".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "vpc-nrt-01".to_owned(),
+            "test-run".to_owned(),
+        );
+        assert_eq!(
+            config.providers(),
+            &[Provider::FoundationWs, Provider::QuickNodeGrpc]
+        );
+        assert!(config.has_provider_comparison());
+        assert_eq!(config.measurement_version(), "canonical-trade-ready-v1");
+        config.vpc_local = true;
+        // On the box no network feed is dialed: the node is the only source and its own reference.
+        assert_eq!(config.providers(), &[Provider::QuickNodeVpc]);
+        assert_eq!(config.cohort(), "quicknode-vpc");
+        assert_eq!(config.reference_provider(), Provider::QuickNodeVpc);
+        assert!(!config.has_provider_comparison());
+        assert_eq!(config.measurement_version(), "fills-vpc-node-v1");
+        let mut mempool = BenchmarkConfig::production(
+            Dataset::Mempool,
+            vec!["BTC".to_owned()],
+            "vpc".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "vpc-nrt-01".to_owned(),
+            "test-run".to_owned(),
+        );
+        mempool.vpc_local = true;
+        assert_eq!(
+            mempool.providers(),
+            &[Provider::QuickNodeGrpc, Provider::QuickNodeVpc]
+        );
+        assert_eq!(mempool.cohort(), "quicknode-grpc+quicknode-vpc");
+        assert!(mempool.has_provider_comparison());
+        assert!(mempool.canonical_by_any_arrival());
+        assert_eq!(mempool.metric_kind(), "box_first_seen_to_bundle_ready");
+        assert_eq!(mempool.measurement_version(), "mempool-box-first-seen-v1");
+        // Off the box the mempool contract is untouched.
+        mempool.vpc_local = false;
+        assert_eq!(mempool.metric_kind(), "mempool_first_seen_to_bundle_ready");
+        assert_eq!(mempool.measurement_version(), "mempool-bundle-ready-v1");
+        assert!(!mempool.has_provider_comparison());
+        // Fills on the box keeps the metric: fill time → canonical-fill-ready, at the node.
+        assert_eq!(config.metric_kind(), "event_to_canonical_trade_ready");
+        // Books on the box are the box's own Quicknode gRPC alone, same metric, own versions.
+        for (dataset, version) in [
+            (Dataset::Bbo, "bbo-vpc-grpc-v1"),
+            (Dataset::L2book, "l2book-vpc-grpc-v1"),
+        ] {
+            let mut book = BenchmarkConfig::production(
+                dataset,
+                vec!["BTC".to_owned()],
+                "vpc".to_owned(),
+                "nrt".to_owned(),
+                "nrt".to_owned(),
+                "vpc-nrt-01".to_owned(),
+                "test-run".to_owned(),
+            );
+            assert_eq!(book.providers().len(), 3);
+            book.vpc_local = true;
+            assert_eq!(book.providers(), &[Provider::QuickNodeVpc]);
+            assert_eq!(book.cohort(), "quicknode-vpc");
+            assert_eq!(book.reference_provider(), Provider::QuickNodeVpc);
+            assert!(!book.has_provider_comparison());
+            assert!(!book.canonical_by_any_arrival());
+            assert_eq!(book.measurement_version(), version);
+            assert_eq!(book.metric_kind(), "event_to_canonical_book_ready");
+        }
+    }
+
+    #[test]
+    fn vpc_local_adds_the_decoded_stream_leg_to_every_peering_mode() {
+        let mut config = BenchmarkConfig::production(
+            Dataset::Peering,
+            vec!["BLOCKS".to_owned()],
+            "vpc".to_owned(),
+            "nrt".to_owned(),
+            "nrt".to_owned(),
+            "vpc-nrt-01".to_owned(),
+            "test-run".to_owned(),
+        );
+        assert!(!config.has_provider_comparison());
+        config.vpc_local = true;
+        assert_eq!(
+            config.providers(),
+            &[Provider::QuickNodePeeringTcp, Provider::QuickNodeVpc]
+        );
+        assert_eq!(config.cohort(), "quicknode-peering-tcp+quicknode-vpc");
+        assert!(config.has_provider_comparison());
+        // Content is the round itself, so no leg is the canonical reference.
+        assert!(config.canonical_by_any_arrival());
+        config.peering_mode = PeeringMode::Comparison;
+        assert_eq!(
+            config.providers(),
+            &[
+                Provider::QuickNodePeeringTcp,
+                Provider::HydromancerPeeringTcp,
+                Provider::QuickNodeVpc
+            ]
+        );
+        assert_eq!(
+            config.cohort(),
+            "quicknode-peering-tcp+hydromancer-peering-tcp+quicknode-vpc"
+        );
+        config.peering_mode = PeeringMode::Hydromancer;
+        assert_eq!(
+            config.providers(),
+            &[Provider::HydromancerPeeringTcp, Provider::QuickNodeVpc]
+        );
+        assert_eq!(config.cohort(), "hydromancer-peering-tcp+quicknode-vpc");
+    }
+    #[test]
+    fn vpc_and_grpc_rows_in_one_window_have_distinct_event_ids() {
+        assert_eq!(event_id_provider(Provider::QuickNodeGrpc), "quicknode");
+        assert_eq!(
+            event_id_provider(Provider::QuickNodePeeringTcp),
+            "quicknode"
+        );
+        assert_eq!(event_id_provider(Provider::QuickNodeVpc), "quicknode-vpc");
+        assert_ne!(
+            event_id_provider(Provider::QuickNodeGrpc),
+            event_id_provider(Provider::QuickNodeVpc)
         );
     }
 }

@@ -62,6 +62,88 @@ canonical trade. This measures public trade-feed delivery. It does not measure
 customer order submission, acknowledgement, order-to-fill, or exchange
 matching-engine execution latency.
 
+## The Quicknode VPC source (fills, books, peering and mempool)
+
+A Quicknode VPC box runs a Hyperliquid node fed by a co-located Quicknode sentry, and the
+customer's own client runs on that box. Its fills are measured where a co-located client would
+read them: the collector itself runs on the box (`--vpc-node-data <hl/data>`) and tails the
+node's own `node_fills_by_block` output as the single `quicknode-vpc` source (`source`
+`quicknode-vpc`, transport `local`, cohort `quicknode-vpc`, `measurement_version`
+`fills-vpc-node-v1`). It dials no network feed from the box: the product is the node beside the
+sentry, so the box records its own fills and the comparison with the network paths is made on
+the dashboard, which draws this leg beside any observer's Quicknode gRPC and Foundation cohort.
+The metric is unchanged (`event_to_canonical_trade_ready`: the fill's own timestamp to the
+canonical fill being ready), so the legs share a reference clock.
+
+The VPC leg reconstructs each trade from the node's two per-user fills with the rule the
+Quicknode gRPC path uses (`parse_quicknode_fill_batch`: same tid, time, coin, price, size and
+hash; the crossing fill's side is the taker side; users are buyer then seller), and it is
+ready when the line is readable and that reconstruction succeeds — the same canonical-trade
+boundary as the gRPC leg. Only lines written after the collector started are timed.
+
+What this does and does not claim: it is the delivery latency of executed fills to a client on
+the box; the VPC leg's advantage over the network paths is the absence of a network hop and of a
+provider pipeline, not a faster matching engine. It carries no fastest share, because there is no
+second source on the box to race; the fastest-share columns exist only where a cohort has two or
+more sources. Runner identity is
+public like every other runner (`vpc-nrt-01`, cloud `vpc`), and the
+`quicknode-vpc` provider can only be stamped by a collector on such a box, so it never
+appears from a network observer. Outcome columns for it are `outcome_quicknode_vpc_*`; it is
+not folded into the Quicknode family because both Quicknode paths are present in one cohort.
+
+**Books (bbo, l2book).** The box also runs the Quicknode gRPC service itself — raptor-grpc beside
+the node, fed by the node through the shared-memory write hook — and a client on the box reaches
+it by a loopback URL. The book collectors on the box (`--vpc-grpc-url http://127.0.0.1:10000`)
+read that service as the single `quicknode-vpc` source: the same gRPC subscription, the same
+canonical-book construction (depth-20 L2, crossed books rejected) and the same
+canonical-book-ready boundary as the fleet's Quicknode gRPC leg, timed from the event's own
+timestamp, one sample per event. No network feed is dialed and no token is sent (there is no edge
+in front of the service). Cohort `quicknode-vpc`, `measurement_version` `bbo-vpc-grpc-v1` and
+`l2book-vpc-grpc-v1`, metric unchanged (`event_to_canonical_book_ready`), so the leg shares a
+reference clock with any observer's three-source book cohort and the dashboard draws it beside
+that cohort. What it claims: the delivery latency of the Quicknode order-book stream to a client on
+the box, without the network hop and without the edge in front of the public endpoint. What it does
+not claim: a cross-checked book — with one source on the box there is no second path to agree
+with, so the admission is the leg's own decode and canonical construction, and it carries no
+fastest share.
+
+**Peering.** On the same box the peering collector adds the sentry itself as the VPC leg
+(`--vpc-decoded-socket <host:port>`). It subscribes to the sentry's decoded stream — the
+customer-facing socket that writes one JSON line per consensus round the moment the round's
+ordering frame arrives, with every referenced bundle decoded — and stamps each round when the
+complete `block` line has been fully read from that socket. That boundary is later than
+block-ready on the wire by exactly the sentry's decode and serialisation and the socket hop,
+which is the cost the product pays to hand a client decoded actions instead of frames; scoring
+both in one per-round cohort is what makes that cost visible. Producer timestamps still come from
+the reference feed, and the line is admitted only when its bundle-hash set equals the chain's for
+that round; a complete line whose set differs, an incomplete proposal never patched, or a round
+the sentry never wrote is a gap, never a sample. The `block` line is the round's proposal
+(pre-finality; the sentry's `commit` line follows one round later): this dataset scores the
+proposal because that is what a client acting on the stream sees, and the source is labelled so.
+Cohort strings gain `+quicknode-vpc` (`quicknode-peering-tcp+quicknode-vpc`, and the
+`hydromancer` and comparison variants), and because every VPC peering cohort has two or more
+sources the fastest-provider share is always published. Disclose which Quicknode endpoint the
+`quicknode-peering` leg dials on that box: a remote peering relay (a network hop) or the box's
+own sentry's gossip serve (no hop) — the first isolates endpoint versus box, the second isolates
+decode plus socket cost.
+
+**Mempool.** The sentry's `bundle` line — one per decoded bundle body, written when its signers
+are recovered, about 140 ms before the ordering that includes it — is the box's pre-consensus
+surface, and on the box it is the `quicknode-vpc` mempool leg beside the Quicknode gRPC mempool
+stream. The two legs cannot share the stream's embedded first-seen timestamp (the sentry line does
+not carry it, and it is another node's clock), so on the box the dataset changes its reference:
+both legs are timed from the **box's first sight** of the bundle — the sentry's receipt time from
+the `bundle` line, or the arrival of the same bundle at the collector if that came first, so no leg
+is ever negative. Rows carry `metric_kind` `box_first_seen_to_bundle_ready` and
+`measurement_version` `mempool-box-first-seen-v1` under the unchanged mempool schema, cohort
+`quicknode-grpc+quicknode-vpc`, one exact two-source cohort per BTC bundle keyed by tx hash (the
+sentry's bundle hash and the node's `mempool_txs` `tx_hash` are the same value). The BTC filter is
+the one the gRPC leg already applies, evaluated on the decoded actions. A bundle the endpoint
+delivered that the sentry never saw is a gap charged to the VPC leg; a bundle the sentry saw that
+the endpoint never sent is scored missing for the endpoint. Off the box the mempool dataset is
+unchanged. The `bundle` line is pre-consensus: the number says how early each path hands a client
+the transactions, not that they will execute.
+
 ## Mempool bundle readiness
 
 Each Quicknode mempool response contains one of the production JSON shapes:
@@ -125,7 +207,9 @@ canonical reference; the cohort is symmetric.
 
 A block is **ready** when its ordering record has been received and parsed
 (consensus round plus the list of referenced transaction bundles) and every
-referenced bundle has been received, decompressed, and validated. The observer
+referenced bundle has been received, decompressed where the wire compressed it
+(small bundles travel uncompressed, about 5 % of mainnet bundles, and count the
+same), and validated. The observer
 wall-clock timestamp is captured at the last required arrival, before the
 bounded event queue, so transport, framing, decompression, and validation are
 included consistently with the other datasets.
