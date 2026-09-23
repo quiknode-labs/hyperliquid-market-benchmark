@@ -22,10 +22,11 @@ also identified independently in emitted events.
   numbers exactly (same box, same window: 4,228 samples, p50/p95/p99 78/100/111 ms both ways).
 - `--peering-source tap-hydromancer`: in comparison mode, tap Hydromancer and dial Quicknode from one
   process — one exact two-source cohort, and the paid service still sends one stream.
-- Peering scores only rounds produced after the subscription (or tap) started. A dialed
-  subscriber is first sent the service's attach replay, and those old rounds scored as
-  seconds-late blocks for five minutes after every reconnect or deploy (Quicknode p99 3.2 s → 1.2 s
-  while the window aged out, Hydromancer's tap unaffected); they are now neither samples nor gaps.
+- Peering scores only rounds produced at least 60 s after a (re)connect or tap start, on every
+  leg. A new subscriber is first sent the service's attach replay and the live rounds queue behind
+  it (dialed Quicknode p50 1.28 s over its first 30 s, 78 ms after); for five minutes after every
+  reconnect or deploy that inflated the p99 to 2–3 s. Those rounds are now neither samples nor gaps.
+  The attach cost itself is real and is tracked on the sentry, not in this steady-state metric.
 - Per-minute `peering tap health` log line (segments, bytes, resets, completed rounds, gap reasons).
 - rustls 0.23.45 (RUSTSEC-2026-0285).
 

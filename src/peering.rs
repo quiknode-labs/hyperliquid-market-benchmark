@@ -57,6 +57,10 @@ const BUNDLE_RETAIN: Duration = Duration::from_secs(120);
 /// A tracked round that has not completed within the cohort deadline is
 /// counted as a gap (it can never enter a latency distribution late anyway).
 const INCOMPLETE_DEADLINE: Duration = Duration::from_secs(5);
+/// Rounds produced in this long after a (re)connect or tap start are not scored (see
+/// `Assembly::score_from_ms`). Measured 2026-09-23: a dialed Quicknode subscription's p50 was
+/// 1.28 s over its first 30 s (attach replay) and 78 ms after.
+const SUBSCRIPTION_WARMUP: Duration = Duration::from_secs(60);
 
 /// One reference-feed line: round, producer time, and per-bundle
 /// [bundle_hash_hex, first_signature_r_hex, action_count].
@@ -93,10 +97,11 @@ struct Assembly {
     gaps_no_ordering: u64,
     gaps_missing_bundle: u64,
     completed: u64,
-    /// Only rounds produced at or after this block time (ms) are scored: the subscription (or tap)
-    /// started then. A dialed subscriber is first sent the service's attach replay — rounds from
-    /// before it connected — which would otherwise score as seconds-late blocks after every
-    /// reconnect; they are neither samples nor gaps.
+    /// Only rounds produced at or after this block time (ms) are scored: [`SUBSCRIPTION_WARMUP`]
+    /// after the subscription (or tap) started. A new subscriber is first sent the service's
+    /// attach replay, and the live rounds produced meanwhile queue behind it, so for up to about a
+    /// minute blocks arrive seconds late: a real cost of (re)attaching, but not steady-state peering
+    /// latency. Rounds before this are neither samples nor gaps. Applied to every leg alike.
     score_from_ms: u64,
 }
 
@@ -112,7 +117,7 @@ impl Assembly {
             gaps_no_ordering: 0,
             gaps_missing_bundle: 0,
             completed: 0,
-            score_from_ms: now_ms(),
+            score_from_ms: now_ms() + SUBSCRIPTION_WARMUP.as_millis() as u64,
         }
     }
 
@@ -1119,7 +1124,7 @@ mod tests {
 
     #[test]
     fn rounds_from_before_the_subscription_are_neither_samples_nor_gaps() {
-        // a fresh assembly scores from "now": an attach-replay round from minutes ago is ignored
+        // a fresh assembly scores from now + warm-up: an attach-replay round is ignored
         let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
         assembly.track_reference(ReferenceLine {
             r: 42,
