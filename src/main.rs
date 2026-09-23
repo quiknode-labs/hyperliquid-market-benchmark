@@ -256,8 +256,15 @@ async fn main() -> Result<()> {
             "--peering-reference (PEERING_REFERENCE_FEED) is required for the peering dataset",
         )?;
         peering::validate_peering_endpoint(&reference, "peering reference feed")?;
-        if args.peering_source == peering::PeeringSource::Tap {
-            for (_, endpoint) in &endpoints {
+        if args.peering_source == peering::PeeringSource::TapHydromancer
+            && peering_mode != PeeringMode::Comparison
+        {
+            anyhow::bail!(
+                "--peering-source tap-hydromancer pairs a tapped Hydromancer leg with a dialed Quicknode leg: it needs --peering-provider comparison"
+            );
+        }
+        for (provider, endpoint) in &endpoints {
+            if args.peering_source.taps(*provider) {
                 endpoint.parse::<std::net::SocketAddrV4>().with_context(|| {
                     format!("--peering-source tap needs an IPv4 ip:port the node is connected to, got {endpoint}")
                 })?;

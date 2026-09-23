@@ -241,6 +241,21 @@ pub enum PeeringSource {
     Dial,
     /// Read the connection the node on this box already holds to the endpoint (`tap.rs`).
     Tap,
+    /// Tap the Hydromancer endpoint (the box's node is that service's paying customer, so a
+    /// second subscription would be billed egress) and dial the Quicknode one: one process, one
+    /// box, one clock, one exact two-source cohort, and the paid service still sends one stream.
+    TapHydromancer,
+}
+
+impl PeeringSource {
+    /// Whether `provider`'s endpoint is read from the node's existing connection.
+    pub fn taps(self, provider: Provider) -> bool {
+        match self {
+            Self::Dial => false,
+            Self::Tap => true,
+            Self::TapHydromancer => provider == Provider::HydromancerPeeringTcp,
+        }
+    }
 }
 
 pub async fn run_peering(
@@ -1092,6 +1107,18 @@ mod tests {
         frame.push(0x01);
         frame.extend_from_slice(&body);
         frame
+    }
+
+    #[test]
+    fn tap_hydromancer_taps_only_the_paid_service_and_dials_quicknode() {
+        let s = PeeringSource::TapHydromancer;
+        assert!(
+            s.taps(Provider::HydromancerPeeringTcp),
+            "the paid service is never dialed"
+        );
+        assert!(!s.taps(Provider::QuickNodePeeringTcp));
+        assert!(PeeringSource::Tap.taps(Provider::QuickNodePeeringTcp));
+        assert!(!PeeringSource::Dial.taps(Provider::HydromancerPeeringTcp));
     }
 
     #[test]

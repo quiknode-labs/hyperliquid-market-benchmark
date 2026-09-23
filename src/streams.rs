@@ -162,13 +162,14 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
                     coin.clone(),
                     sender.clone(),
                 );
-                tasks.push(match config.peering_source {
-                    crate::peering::PeeringSource::Dial => tokio::spawn(
-                        crate::peering::run_peering(args.0, args.1, args.2, args.3, args.4),
-                    ),
-                    crate::peering::PeeringSource::Tap => tokio::spawn(
-                        crate::peering::run_peering_tap(args.0, args.1, args.2, args.3, args.4),
-                    ),
+                tasks.push(if config.peering_source.taps(*provider) {
+                    tokio::spawn(crate::peering::run_peering_tap(
+                        args.0, args.1, args.2, args.3, args.4,
+                    ))
+                } else {
+                    tokio::spawn(crate::peering::run_peering(
+                        args.0, args.1, args.2, args.3, args.4,
+                    ))
                 });
             }
             if let Some(socket) = &config.vpc_decoded_socket {
