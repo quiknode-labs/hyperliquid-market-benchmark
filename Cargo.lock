@@ -758,6 +758,7 @@ dependencies = [
  "clap",
  "fs2",
  "futures-util",
+ "libc",
  "lz4_flex",
  "prost",
  "prost-build",

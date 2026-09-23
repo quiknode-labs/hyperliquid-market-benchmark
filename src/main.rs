@@ -19,6 +19,7 @@ mod grpc;
 mod model;
 mod peering;
 mod streams;
+mod tap;
 mod vpc_mempool;
 
 const EVENT_QUEUE_CAPACITY: usize = 16_384;
@@ -78,6 +79,13 @@ struct Args {
     /// row is stamped with its own provider and source. See docs/PEERING_TEST.md.
     #[arg(long, value_enum, env = "PEERING_PROVIDER", default_value_t = PeeringMode::Quicknode)]
     peering_provider: PeeringMode,
+
+    /// How the peering dataset reads each service. `dial` opens its own subscription (a second
+    /// stream to the box when a node there already peers with the service). `tap` opens nothing:
+    /// it reads the connection the node on THIS box already holds to the endpoint (read-only
+    /// capture, CAP_NET_RAW, Linux), so the service sends the box one stream. See docs/PEERING_TEST.md.
+    #[arg(long, value_enum, env = "PEERING_SOURCE", default_value_t = peering::PeeringSource::Dial)]
+    peering_source: peering::PeeringSource,
 
     /// Peering block reference feed (host:port, NDJSON). Deterministic chain data
     /// reproducible from any Hyperliquid node's replay output; see METHODOLOGY.
@@ -247,6 +255,13 @@ async fn main() -> Result<()> {
             "--peering-reference (PEERING_REFERENCE_FEED) is required for the peering dataset",
         )?;
         peering::validate_peering_endpoint(&reference, "peering reference feed")?;
+        if args.peering_source == peering::PeeringSource::Tap {
+            for (_, endpoint) in &endpoints {
+                endpoint.parse::<std::net::SocketAddrV4>().with_context(|| {
+                    format!("--peering-source tap needs an IPv4 ip:port the node is connected to, got {endpoint}")
+                })?;
+            }
+        }
         (endpoints, reference)
     } else {
         (Vec::new(), String::new())
@@ -329,6 +344,7 @@ async fn main() -> Result<()> {
             quicknode_token,
             peering_endpoints,
             peering_reference,
+            peering_source: args.peering_source,
             vpc_node_data,
             vpc_decoded_socket,
             vpc_grpc,
