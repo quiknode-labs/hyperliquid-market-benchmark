@@ -387,10 +387,10 @@ mod linux {
                         continue;
                     }
                     let wall_ns = kernel_timestamp(&msg).unwrap_or_else(now_ns);
-                    if let Some(seg) = parse_ipv4_tcp(&buf[..n as usize], src, src_port, wall_ns) {
-                        if tx.blocking_send(seg).is_err() {
-                            break;
-                        }
+                    if let Some(seg) = parse_ipv4_tcp(&buf[..n as usize], src, src_port, wall_ns)
+                        && tx.blocking_send(seg).is_err()
+                    {
+                        break;
                     }
                 }
                 // SAFETY: fd is owned by this thread from here on.
