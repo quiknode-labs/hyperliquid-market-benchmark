@@ -57,6 +57,10 @@ const BUNDLE_RETAIN: Duration = Duration::from_secs(120);
 /// A tracked round that has not completed within the cohort deadline is
 /// counted as a gap (it can never enter a latency distribution late anyway).
 const INCOMPLETE_DEADLINE: Duration = Duration::from_secs(5);
+/// Rounds produced in this long after a (re)connect or tap start are not scored (see
+/// `Assembly::score_from_ms`). Measured 2026-09-23: a dialed Quicknode subscription's p50 was
+/// 1.28 s over its first 30 s (attach replay) and 78 ms after.
+const SUBSCRIPTION_WARMUP: Duration = Duration::from_secs(60);
 
 /// One reference-feed line: round, producer time, and per-bundle
 /// [bundle_hash_hex, first_signature_r_hex, action_count].
@@ -93,6 +97,12 @@ struct Assembly {
     gaps_no_ordering: u64,
     gaps_missing_bundle: u64,
     completed: u64,
+    /// Only rounds produced at or after this block time (ms) are scored: [`SUBSCRIPTION_WARMUP`]
+    /// after the subscription (or tap) started. A new subscriber is first sent the service's
+    /// attach replay, and the live rounds produced meanwhile queue behind it, so for up to about a
+    /// minute blocks arrive seconds late: a real cost of (re)attaching, but not steady-state peering
+    /// latency. Rounds before this are neither samples nor gaps. Applied to every leg alike.
+    score_from_ms: u64,
 }
 
 impl Assembly {
@@ -107,6 +117,7 @@ impl Assembly {
             gaps_no_ordering: 0,
             gaps_missing_bundle: 0,
             completed: 0,
+            score_from_ms: now_ms() + SUBSCRIPTION_WARMUP.as_millis() as u64,
         }
     }
 
@@ -142,6 +153,11 @@ impl Assembly {
             bundle_sigs.push(sig);
         }
         self.max_ref_round = self.max_ref_round.max(line.r);
+        if time_ms < self.score_from_ms {
+            // produced before this subscription existed (attach replay): not a sample, not a gap
+            self.rounds.remove(&line.r);
+            return;
+        }
         let entry = self.rounds.entry(line.r).or_default();
         entry.first_seen.get_or_insert(Instant::now());
         entry.reference = Some(ReferenceRound {
@@ -1099,6 +1115,31 @@ pub fn validate_peering_endpoint(endpoint: &str, label: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// An assembly that scores every round (fixtures carry historical block times).
+    fn test_assembly() -> Assembly {
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        assembly.score_from_ms = 0;
+        assembly
+    }
+
+    #[test]
+    fn rounds_from_before_the_subscription_are_neither_samples_nor_gaps() {
+        // a fresh assembly scores from now + warm-up: an attach-replay round is ignored
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        assembly.track_reference(ReferenceLine {
+            r: 42,
+            t: "2026-09-23T00:00:00.000000000".to_owned(),
+            b: Vec::new(),
+        });
+        assert!(
+            assembly.rounds.is_empty(),
+            "a round produced before the subscription is not tracked"
+        );
+        let (ready, gaps) = assembly.drain_ready(Instant::now() + Duration::from_secs(60));
+        assert!(ready.is_empty());
+        assert_eq!(gaps, 0);
+    }
+
     fn lz4_frame(payload: &[u8]) -> Vec<u8> {
         let compressed = lz4_flex::block::compress(payload);
         let mut body = (payload.len() as u32).to_le_bytes().to_vec();
@@ -1196,7 +1237,7 @@ mod tests {
 
     #[test]
     fn only_rounds_the_chain_produced_can_expire_as_gaps() {
-        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut assembly = test_assembly();
         let t0 = Instant::now();
         assembly.track_reference(reference_line(
             2_000_000,
@@ -1231,7 +1272,7 @@ mod tests {
         assert!(parse_hex32(&format!("0x{}", "ab".repeat(33))).is_none());
         assert!(parse_hex32("0xzz").is_none());
         // A round whose bundle signature the feed printed short must complete like any other.
-        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut assembly = test_assembly();
         let mut sig = [0x66; 32];
         sig[0] = 0x00;
         assembly.track_reference(ReferenceLine {
@@ -1253,7 +1294,7 @@ mod tests {
 
     #[test]
     fn an_uncompressed_kind0_bundle_frame_completes_its_round() {
-        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut assembly = test_assembly();
         let sig = [0x55; 32];
         assembly.track_reference(reference_line(
             1_000_300,
@@ -1283,7 +1324,7 @@ mod tests {
 
     #[test]
     fn block_ready_boundary_is_the_last_required_arrival() {
-        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut assembly = test_assembly();
         let sig_a = [0x11; 32];
         let sig_b = [0x22; 32];
         assembly.track_reference(reference_line(
@@ -1318,7 +1359,7 @@ mod tests {
 
     #[test]
     fn incomplete_round_expires_into_exactly_one_gap() {
-        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut assembly = test_assembly();
         assembly.track_reference(reference_line(
             2_000_000,
             "2026-08-10T14:43:15.0",
@@ -1339,7 +1380,7 @@ mod tests {
 
     #[test]
     fn ordering_rounds_outside_the_reference_window_are_ignored() {
-        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut assembly = test_assembly();
         assembly.track_reference(reference_line(
             1_000_000,
             "2026-08-10T14:43:15.0",
@@ -1366,7 +1407,7 @@ mod tests {
 
         let mut buf = lz4_frame(&ordering);
         buf.extend_from_slice(&lz4_frame(&bundle));
-        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut assembly = test_assembly();
         assembly.track_reference(reference_line(1_500_000, "2026-08-10T14:43:15.0", &[sig]));
         consume_frames(&mut buf, &mut assembly, Instant::now(), 42).unwrap();
         assert!(buf.is_empty(), "both frames fully consumed");
@@ -1380,7 +1421,7 @@ mod tests {
 
     #[test]
     fn oversize_frame_is_a_desync_error_and_partial_frames_wait() {
-        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut assembly = test_assembly();
         let mut oversize = (MAX_FRAME_BODY + 1).to_be_bytes().to_vec();
         oversize.push(0x01);
         assert!(consume_frames(&mut oversize, &mut assembly, Instant::now(), 0).is_err());

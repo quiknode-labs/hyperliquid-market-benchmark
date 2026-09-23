@@ -6,6 +6,31 @@ also identified independently in emitted events.
 
 ## Unreleased
 
+## 0.5.0
+
+- **Peering: ordering records are parsed in both layout epochs.** Since the 2026-09-13 ~08:37Z
+  Hyperliquid upgrade a record no longer leads with `fc round`; the round closes its certificate
+  tail. The marker scan recognised about one round in four from then on (samples per 5-minute
+  window ~2,570 → ~660, the rest counted as `sequence_gaps`). `src/ordering.rs` parses the parent
+  slot and the own record structurally (including `fb u16` tails and timeout certificates);
+  17 mainnet fixtures. Same metric and `measurement_version` (`peering-block-ready-v1`): only rounds
+  that were wrongly dropped now complete (~4,228 per window, a handful of gaps).
+- **Peering tap source** (`--peering-source tap`, Linux, `CAP_NET_RAW`): read the connection a
+  node on the box already holds to the service instead of opening a second subscription. The
+  service sends the box one stream. Read-only capture, in-order TCP reassembly (holes reset and
+  resynchronise, never spliced), kernel receive timestamps. On one stream it reproduces the dialed
+  numbers exactly (same box, same window: 4,228 samples, p50/p95/p99 78/100/111 ms both ways).
+- `--peering-source tap-hydromancer`: in comparison mode, tap Hydromancer and dial Quicknode from one
+  process — one exact two-source cohort, and the paid service still sends one stream.
+- Peering scores only rounds produced at least 60 s after a (re)connect or tap start, on every
+  leg. A new subscriber is first sent the service's attach replay and the live rounds queue behind
+  it (dialed Quicknode p50 1.28 s over its first 30 s, 78 ms after); for five minutes after every
+  reconnect or deploy that inflated the p99 to 2–3 s. Those rounds are now neither samples nor gaps.
+  The attach cost itself is real and is tracked on the sentry, not in this steady-state metric.
+- Per-minute `peering tap health` log line (segments, bytes, resets, completed rounds, gap reasons).
+- rustls 0.23.45 (RUSTSEC-2026-0285).
+
+
 - Books on the Quicknode VPC box (`--vpc-grpc-url http://127.0.0.1:10000`, bbo and l2book
   only, loopback plaintext only, no token): the box's own Quicknode gRPC service is the
   single `quicknode-vpc` source, cohort `quicknode-vpc`, `measurement_version`
