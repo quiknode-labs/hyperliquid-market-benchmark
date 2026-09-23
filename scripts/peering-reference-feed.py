@@ -28,6 +28,14 @@ clients = []
 clients_lock = threading.Lock()
 
 
+
+def hex32(value):
+    """0x-prefixed, zero-padded 64-digit hex for a 32-byte value the node may print unpadded."""
+    if value is None:
+        return None
+    digits = value[2:] if value.startswith("0x") else value
+    return "0x" + digits.rjust(64, "0")
+
 def newest_file():
     try:
         sess = os.path.join(BASE, sorted(os.listdir(BASE))[-1])
@@ -44,8 +52,10 @@ def compact(raw):
         out = {"r": block["round"], "t": block["time"], "b": []}
         for entry in block.get("signed_action_bundles", []):
             actions = entry[1].get("signed_actions", [])
-            first_r = actions[0]["signature"]["r"] if actions else None
-            out["b"].append([entry[0], first_r, len(actions)])
+            # The node prints signature values without leading zeros; emit fixed 32-byte hex so
+            # every consumer sees the same 64 digits the wire carries.
+            first_r = hex32(actions[0]["signature"]["r"]) if actions else None
+            out["b"].append([hex32(entry[0]), first_r, len(actions)])
         return (json.dumps(out, separators=(",", ":")) + "\n").encode()
     except (KeyError, ValueError, TypeError, IndexError):
         return None

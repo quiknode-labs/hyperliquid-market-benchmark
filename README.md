@@ -163,6 +163,67 @@ explicit incomplete cohort without stopping the other streams. Every
 30-second window must be durably admitted within 20 seconds; if local
 publication stalls, the process exits so its service supervisor can restart it.
 
+### The Quicknode VPC source (fills, books, peering and mempool, on the VPC box)
+
+A collector running on a Quicknode VPC box (sentry + Hyperliquid node on one machine) records
+the box's own node output as the fills source:
+
+```bash
+VPC_NODE_DATA=/data/hype/mainnet/hl_visor/hl/data \
+hyperliquid-market-benchmark --dataset fills --coins BTC --runner vpc-nrt-01
+```
+
+`--vpc-node-data` tails `node_fills_by_block` as the single `quicknode-vpc` source (cohort
+`quicknode-vpc`, `measurement_version` `fills-vpc-node-v1`); the process dials no network feed
+and needs no gRPC token. Each trade is timed from its own fill timestamp to canonical-fill-ready
+at the node, the same boundary the gRPC path is scored at elsewhere, so the dashboard can draw
+this leg beside any observer's cohort (`docs/METHODOLOGY.md`, "The Quicknode VPC source"). It is
+refused for any other dataset and when the directory has no fills tree. The runner is public
+like every other (`cloud` `vpc`).
+
+For the book datasets the same box reads its own Quicknode gRPC service — raptor-grpc running
+beside the node, fed through the shared-memory write hook — over loopback, as the single
+`quicknode-vpc` source:
+
+```bash
+VPC_GRPC_URL=http://127.0.0.1:10000 \
+hyperliquid-market-benchmark --dataset bbo --coins BTC --runner vpc-nrt-01
+VPC_GRPC_URL=http://127.0.0.1:10000 \
+hyperliquid-market-benchmark --dataset l2book --coins BTC --runner vpc-nrt-01
+```
+
+`--vpc-grpc-url` is refused for any other dataset and for anything but a plaintext loopback
+origin with a port (there is no edge in front of the box's service, so no token). Cohort
+`quicknode-vpc`, `measurement_version` `bbo-vpc-grpc-v1` / `l2book-vpc-grpc-v1`, metric
+unchanged: the same subscription, canonical-book construction and boundary as the Quicknode gRPC
+leg, timed from the event's own timestamp, so the dashboard draws this leg beside any observer's
+three-source cohort.
+
+For peering the same box adds the sentry's own decoded stream — the customer-facing socket that
+writes each consensus round's decoded `block` line as the ordering arrives — as the
+`quicknode-vpc` leg beside the dialed peering service(s):
+
+```bash
+PEERING_PROVIDER=quicknode QUICKNODE_PEERING_ENDPOINT=<gossip serve host:port> \
+PEERING_REFERENCE_FEED=<node host:9464> VPC_DECODED_SOCKET=<sentry decoded host:port> \
+hyperliquid-market-benchmark --dataset peering --coins BLOCKS --runner vpc-nrt-01
+```
+
+`--vpc-decoded-socket` is refused for any other dataset and when it names a wire the process
+already dials. The leg is stamped when the complete line is read from the socket and admitted only
+when its bundle set equals the chain's (`docs/PEERING_TEST.md`, "Tier A on the Quicknode VPC box").
+
+For mempool the same socket's `bundle` lines are the `quicknode-vpc` leg beside the Quicknode gRPC
+mempool stream, both timed from the box's first sight of each BTC bundle:
+
+```bash
+VPC_DECODED_SOCKET=<sentry decoded host:port> \
+hyperliquid-market-benchmark --dataset mempool --coins BTC --runner vpc-nrt-01
+```
+
+Rows then carry `metric_kind` `box_first_seen_to_bundle_ready` (`docs/METHODOLOGY.md`, "The
+Quicknode VPC source", mempool paragraph).
+
 ## Public observer identity
 
 Telemetry contains a stable public runner ID, cloud, logical comparison region,

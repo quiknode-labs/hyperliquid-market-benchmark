@@ -19,6 +19,8 @@
 //! Wire protocol (Hyperliquid gossip, network-public):
 //!   frame:    [u32 BE body_len][u8 kind][body]
 //!   kind 1:   body = [u32 LE uncompressed_size][raw LZ4 block]
+//!   kind 0:   control, except a body whose first byte is 0x01: a small transaction
+//!             bundle sent uncompressed (the body IS the payload below)
 //!   payload[0] == 0x00 -> block/ordering data (round + referenced bundle list)
 //!   payload[0] == 0x01 -> transaction bundle (length-indexed signed records)
 
@@ -87,6 +89,10 @@ struct Assembly {
     bundles: HashMap<[u8; 32], (Instant, u64, Instant)>,
     max_ref_round: u64,
     emitted_high_water: u64,
+    /// Why rounds the chain produced did not complete (logged by the tap; see `gap_reasons`).
+    gaps_no_ordering: u64,
+    gaps_missing_bundle: u64,
+    completed: u64,
 }
 
 impl Assembly {
@@ -98,6 +104,9 @@ impl Assembly {
             bundles: HashMap::new(),
             max_ref_round: 0,
             emitted_high_water: 0,
+            gaps_no_ordering: 0,
+            gaps_missing_bundle: 0,
+            completed: 0,
         }
     }
 
@@ -160,7 +169,14 @@ impl Assembly {
                     .is_some_and(|seen| now.duration_since(seen) > INCOMPLETE_DEADLINE)
                 {
                     tracked.reported_gap = true;
-                    expired_gaps += 1;
+                    // A round the reference feed never named is not a block the service failed
+                    // to deliver: the ordering scan also matches round-shaped bytes inside the
+                    // frame's quorum material (rounds the chain never produced). Only a round the
+                    // chain produced and the wire did not complete is a gap.
+                    if tracked.reference.is_some() {
+                        expired_gaps += 1;
+                        self.gaps_no_ordering += 1;
+                    }
                 }
                 continue;
             };
@@ -188,10 +204,12 @@ impl Assembly {
                 {
                     tracked.reported_gap = true;
                     expired_gaps += 1;
+                    self.gaps_missing_bundle += 1;
                 }
                 continue;
             }
             tracked.reported_gap = true; // completed; never revisit
+            self.completed += 1;
             ready.push(MarketEvent {
                 provider: self.provider,
                 key: EventKey {
@@ -213,6 +231,30 @@ impl Assembly {
         self.rounds.retain(|round, _| *round >= floor);
         self.bundles
             .retain(|_, (_, _, seen)| now.duration_since(*seen) < BUNDLE_RETAIN);
+    }
+}
+
+/// Where the peering dataset's bytes come from (`--peering-source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PeeringSource {
+    /// Open our own subscription to the endpoint.
+    Dial,
+    /// Read the connection the node on this box already holds to the endpoint (`tap.rs`).
+    Tap,
+    /// Tap the Hydromancer endpoint (the box's node is that service's paying customer, so a
+    /// second subscription would be billed egress) and dial the Quicknode one: one process, one
+    /// box, one clock, one exact two-source cohort, and the paid service still sends one stream.
+    TapHydromancer,
+}
+
+impl PeeringSource {
+    /// Whether `provider`'s endpoint is read from the node's existing connection.
+    pub fn taps(self, provider: Provider) -> bool {
+        match self {
+            Self::Dial => false,
+            Self::Tap => true,
+            Self::TapHydromancer => provider == Provider::HydromancerPeeringTcp,
+        }
     }
 }
 
@@ -252,21 +294,7 @@ async fn run_peering_once(
 ) -> Result<()> {
     // Reference feed first: samples cannot close without it, and its rounds
     // anchor the plausibility window for ordering extraction.
-    let reference = TcpStream::connect(reference_endpoint)
-        .await
-        .context("connect peering reference feed")?;
-    let (ref_tx, mut ref_rx) = mpsc::channel::<ReferenceLine>(4096);
-    let reference_task = tokio::spawn(async move {
-        let mut lines = BufReader::new(reference).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let Ok(parsed) = serde_json::from_str::<ReferenceLine>(&line) else {
-                continue;
-            };
-            if ref_tx.send(parsed).await.is_err() {
-                break;
-            }
-        }
-    });
+    let (reference_task, mut ref_rx) = spawn_reference_reader(reference_endpoint).await?;
 
     let mut stream = TcpStream::connect(endpoint)
         .await
@@ -324,6 +352,506 @@ async fn run_peering_once(
     }
 }
 
+/// TAP source (see `tap.rs`): the same assembly as [`run_peering`], fed from the connection a
+/// node on this box already holds to `endpoint` instead of a second subscription. Sends nothing
+/// to the service.
+pub async fn run_peering_tap(
+    provider: Provider,
+    endpoint: String,
+    reference_endpoint: String,
+    coin: String,
+    sender: ProbeSender,
+) {
+    let mut backoff = ReconnectBackoff::default();
+    loop {
+        let started = Instant::now();
+        match run_peering_tap_once(provider, &endpoint, &reference_endpoint, &coin, &sender).await {
+            Ok(()) => warn!(%coin, "peering tap ended"),
+            Err(error) => warn!(%coin, ?error, "peering tap failed"),
+        }
+        if !sender
+            .send(ProbeEvent::Reconnect {
+                provider,
+                coin: coin.clone(),
+            })
+            .await
+        {
+            return;
+        }
+        tokio::time::sleep(backoff.after_connection(started.elapsed())).await;
+    }
+}
+
+/// One byte stream per tapped connection (local port), each resynchronised independently.
+#[derive(Default)]
+struct TapFlow {
+    reassembler: crate::tap::Reassembler,
+    buf: Vec<u8>,
+    synced: bool,
+}
+
+async fn run_peering_tap_once(
+    provider: Provider,
+    endpoint: &str,
+    reference_endpoint: &str,
+    coin: &str,
+    sender: &ProbeSender,
+) -> Result<()> {
+    let addr: std::net::SocketAddrV4 = endpoint.parse().context(
+        "peering tap endpoint must be an IPv4 ip:port (the peer the node is connected to)",
+    )?;
+    let (reference_task, mut ref_rx) = spawn_reference_reader(reference_endpoint).await?;
+    let (seg_tx, mut seg_rx) = mpsc::channel::<crate::tap::Segment>(65_536);
+    let _capture = crate::tap::spawn_capture(*addr.ip(), addr.port(), seg_tx)?;
+    let _connection = sender.connected(provider, coin);
+
+    let mut assembly = Assembly::new(provider, coin.to_owned());
+    let mut flows: HashMap<u16, TapFlow> = HashMap::new();
+    let mut maintenance = tokio::time::interval(Duration::from_millis(100));
+    let mut last_bytes = Instant::now();
+    let mut resets = 0u64;
+    let mut tapped_bytes = 0u64;
+    let mut segments = 0u64;
+    let mut health = tokio::time::interval(Duration::from_secs(60));
+    health.tick().await;
+
+    loop {
+        let mut deliveries = Vec::new();
+        tokio::select! {
+            seg = seg_rx.recv() => {
+                let Some(seg) = seg else { anyhow::bail!("peering tap capture stopped") };
+                segments += 1;
+                let flow = flows.entry(seg.dst_port).or_default();
+                deliveries.push((seg.dst_port, flow.reassembler.push(seg, Instant::now())));
+            }
+            line = ref_rx.recv() => {
+                let Some(line) = line else { anyhow::bail!("peering reference feed ended") };
+                assembly.track_reference(line);
+            }
+            _ = health.tick() => {
+                // One line a minute: what the tap saw and why rounds did or did not complete.
+                tracing::info!(
+                    %endpoint, flows = flows.len(), segments, tapped_bytes, resets,
+                    completed = assembly.completed,
+                    gaps_no_ordering = assembly.gaps_no_ordering,
+                    gaps_missing_bundle = assembly.gaps_missing_bundle,
+                    tracked_bundles = assembly.bundles.len(),
+                    "peering tap health"
+                );
+            }
+            _ = maintenance.tick() => {
+                let now = Instant::now();
+                for (port, flow) in flows.iter_mut() {
+                    deliveries.push((*port, flow.reassembler.tick(now)));
+                }
+                if now.duration_since(last_bytes) > READ_DEADLINE {
+                    anyhow::bail!("no tapped bytes from {endpoint} for {READ_DEADLINE:?}: is a node on this box connected to it?");
+                }
+            }
+        }
+        for (port, out) in deliveries {
+            let flow = flows.get_mut(&port).expect("flow exists");
+            for delivery in out {
+                match delivery {
+                    crate::tap::Delivery::Reset { reason } => {
+                        resets += 1;
+                        warn!(%endpoint, port, reason, resets, "peering tap stream reset; resynchronising");
+                        flow.buf.clear();
+                        flow.synced = false;
+                    }
+                    crate::tap::Delivery::Bytes { data, wall_ns } => {
+                        last_bytes = Instant::now();
+                        tapped_bytes += data.len() as u64;
+                        flow.buf.extend_from_slice(&data);
+                        // Kernel receive time -> the monotonic clock the assembly uses.
+                        let wall_ms = wall_ns / 1_000_000;
+                        let behind = now_ms().saturating_sub(wall_ms);
+                        let arrival = Instant::now()
+                            .checked_sub(Duration::from_millis(behind))
+                            .unwrap_or_else(Instant::now);
+                        if !flow.synced {
+                            match find_frame_boundary(&flow.buf) {
+                                Some(offset) => {
+                                    flow.buf.drain(..offset);
+                                    flow.synced = true;
+                                }
+                                None => {
+                                    // Keep the tail only: a boundary lies within one max frame.
+                                    let keep = (MAX_FRAME_BODY as usize + 5) * 2;
+                                    if flow.buf.len() > keep {
+                                        let cut = flow.buf.len() - keep;
+                                        flow.buf.drain(..cut);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Err(error) =
+                            consume_frames(&mut flow.buf, &mut assembly, arrival, wall_ms)
+                        {
+                            warn!(%endpoint, port, ?error, "peering tap desync; resynchronising");
+                            flow.buf.clear();
+                            flow.synced = false;
+                        }
+                    }
+                }
+            }
+        }
+        let (ready, expired) = assembly.drain_ready(Instant::now());
+        for event in ready {
+            if !sender.send(ProbeEvent::Market(event)).await {
+                reference_task.abort();
+                return Ok(());
+            }
+        }
+        if expired > 0
+            && !sender
+                .send(ProbeEvent::SequenceGap {
+                    provider,
+                    coin: coin.to_owned(),
+                    missing: expired,
+                })
+                .await
+        {
+            reference_task.abort();
+            return Ok(());
+        }
+    }
+}
+
+/// Frames needed in a row before a byte offset is trusted as a boundary after joining mid-stream.
+const RESYNC_FRAMES: usize = 4;
+
+/// First offset in `buf` where RESYNC_FRAMES consecutive well-formed frames start, at least one of
+/// them a kind-1 frame that decompresses. None if `buf` does not yet hold enough bytes to decide.
+fn find_frame_boundary(buf: &[u8]) -> Option<usize> {
+    'start: for start in 0..buf.len().saturating_sub(5) {
+        let mut offset = start;
+        let mut decoded = false;
+        for _ in 0..RESYNC_FRAMES {
+            if buf.len() - offset < 5 {
+                continue 'start;
+            }
+            let body_len = u32::from_be_bytes([
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            ]);
+            let kind = buf[offset + 4];
+            if body_len == 0 || body_len > MAX_FRAME_BODY || kind > 1 {
+                continue 'start;
+            }
+            let total = 5 + body_len as usize;
+            if buf.len() - offset < total {
+                continue 'start;
+            }
+            if kind == 1 {
+                if decompress_data_frame(&buf[offset + 5..offset + total]).is_none() {
+                    continue 'start;
+                }
+                decoded = true;
+            }
+            offset += total;
+        }
+        if decoded {
+            return Some(start);
+        }
+    }
+    None
+}
+
+/// Longest decoded line accepted from the sentry socket. A 2 000-action block serialises to a
+/// few MiB; anything past this is a desynced or hostile stream, not data.
+const MAX_DECODED_LINE: usize = 64 * 1024 * 1024;
+
+/// One line of the co-located sentry's decoded stream, read for the fields the round join
+/// needs. `block` and `block_patch` carry the round's bundle hashes in execution order; every
+/// other line type (`commit`, `skip`, `orphan`) is skipped. Shape: hl-relay
+/// `docs/decoded-stream-schema.md`.
+#[derive(Debug, Deserialize)]
+struct DecodedLine {
+    #[serde(rename = "type")]
+    kind: String,
+    round: u64,
+    #[serde(default)]
+    complete: bool,
+    #[serde(default)]
+    signed_action_bundles: Vec<(String, serde::de::IgnoredAny)>,
+}
+
+#[derive(Debug, Default)]
+struct DecodedRound {
+    /// First complete `block`/`block_patch` line: arrival, arrival wall ms, sorted bundle hashes.
+    line: Option<(Instant, u64, Vec<[u8; 32]>)>,
+    /// Reference feed: producer time ms, sorted bundle hashes.
+    reference: Option<(u64, Vec<[u8; 32]>)>,
+    first_seen: Option<Instant>,
+    reported: bool,
+}
+
+/// Joins the sentry's decoded `block` lines with the reference feed by round. A round is READY
+/// for the VPC leg when a complete line has been fully read from the socket and its bundle hash
+/// set equals the chain's (from the reference feed). A complete line whose bundle set differs,
+/// an incomplete line never patched, or a round the sentry never wrote is a gap, never a sample.
+struct DecodedAssembly {
+    coin: String,
+    rounds: HashMap<u64, DecodedRound>,
+    max_ref_round: u64,
+}
+
+impl DecodedAssembly {
+    fn new(coin: String) -> Self {
+        Self {
+            coin,
+            rounds: HashMap::new(),
+            max_ref_round: 0,
+        }
+    }
+
+    fn track_line(&mut self, line: DecodedLine, arrival: Instant, wall_ms: u64) {
+        if line.kind != "block" && line.kind != "block_patch" {
+            return;
+        }
+        // Same plausibility window as the wire path: no anchor, no tracking.
+        if self.max_ref_round == 0 || line.round.abs_diff(self.max_ref_round) > ROUND_WINDOW {
+            return;
+        }
+        let entry = self.rounds.entry(line.round).or_default();
+        entry.first_seen.get_or_insert(arrival);
+        if !line.complete || entry.line.is_some() {
+            // An incomplete proposal waits for its `block_patch`; a re-sent complete line
+            // never moves the boundary.
+            return;
+        }
+        let mut hashes = Vec::with_capacity(line.signed_action_bundles.len());
+        for (hash, _) in &line.signed_action_bundles {
+            let Some(hash) = parse_hex32(hash) else {
+                return;
+            };
+            hashes.push(hash);
+        }
+        hashes.sort_unstable();
+        entry.line = Some((arrival, wall_ms, hashes));
+    }
+
+    fn track_reference(&mut self, line: ReferenceLine) {
+        let Some(time_ms) = parse_reference_time_ms(&line.t) else {
+            return;
+        };
+        let mut hashes = Vec::with_capacity(line.b.len());
+        for (hash, _first_r, _count) in &line.b {
+            let Some(hash) = parse_hex32(hash) else {
+                return;
+            };
+            hashes.push(hash);
+        }
+        hashes.sort_unstable();
+        self.max_ref_round = self.max_ref_round.max(line.r);
+        let entry = self.rounds.entry(line.r).or_default();
+        entry.first_seen.get_or_insert(Instant::now());
+        entry.reference = Some((time_ms, hashes));
+    }
+
+    /// Ready events plus the number of rounds that closed without a sample (each counted once).
+    fn drain_ready(&mut self, now: Instant) -> (Vec<MarketEvent>, u64) {
+        let mut ready = Vec::new();
+        let mut gaps = 0u64;
+        for (round, tracked) in self.rounds.iter_mut() {
+            if tracked.reported {
+                continue;
+            }
+            match (&tracked.line, &tracked.reference) {
+                (Some((arrived, wall, hashes)), Some((time_ms, reference_hashes))) => {
+                    tracked.reported = true;
+                    if hashes != reference_hashes {
+                        // The sentry's block is not the chain's block: an integrity failure,
+                        // counted and excluded.
+                        gaps += 1;
+                        continue;
+                    }
+                    ready.push(MarketEvent {
+                        provider: Provider::QuickNodeVpc,
+                        key: EventKey {
+                            coin: self.coin.clone(),
+                            event_ms: *time_ms,
+                            content: ContentKey::Peering { round: *round },
+                        },
+                        received: *arrived,
+                        received_wall_ms: *wall,
+                    });
+                }
+                _ => {
+                    if tracked
+                        .first_seen
+                        .is_some_and(|seen| now.duration_since(seen) > INCOMPLETE_DEADLINE)
+                    {
+                        tracked.reported = true;
+                        gaps += 1;
+                    }
+                }
+            }
+        }
+        let floor = self.max_ref_round.saturating_sub(ROUND_RETAIN);
+        self.rounds.retain(|round, _| *round >= floor);
+        (ready, gaps)
+    }
+}
+
+/// The Quicknode VPC peering leg: subscribe to the co-located sentry's decoded stream socket and
+/// score each round's `block` line beside the dialed peering service(s). Only a collector on the
+/// VPC box can run this; the socket is bound to that box.
+pub async fn run_vpc_decoded(
+    endpoint: String,
+    reference_endpoint: String,
+    coin: String,
+    sender: ProbeSender,
+) {
+    let provider = Provider::QuickNodeVpc;
+    let mut backoff = ReconnectBackoff::default();
+    loop {
+        let started = Instant::now();
+        match run_vpc_decoded_once(&endpoint, &reference_endpoint, &coin, &sender).await {
+            Ok(()) => warn!(%coin, "decoded stream ended"),
+            Err(error) => warn!(%coin, ?error, "decoded stream disconnected"),
+        }
+        if !sender
+            .send(ProbeEvent::Reconnect {
+                provider,
+                coin: coin.clone(),
+            })
+            .await
+        {
+            return;
+        }
+        tokio::time::sleep(backoff.after_connection(started.elapsed())).await;
+    }
+}
+
+async fn run_vpc_decoded_once(
+    endpoint: &str,
+    reference_endpoint: &str,
+    coin: &str,
+    sender: &ProbeSender,
+) -> Result<()> {
+    let (reference_task, mut ref_rx) = spawn_reference_reader(reference_endpoint).await?;
+    let stream = TcpStream::connect(endpoint)
+        .await
+        .context("connect decoded stream socket")?;
+    let _connection = sender.connected(Provider::QuickNodeVpc, coin);
+
+    let mut reader = BufReader::with_capacity(1 << 20, stream);
+    let mut line: Vec<u8> = Vec::with_capacity(1 << 20);
+    let mut assembly = DecodedAssembly::new(coin.to_owned());
+    let mut maintenance = tokio::time::interval(Duration::from_millis(500));
+
+    loop {
+        tokio::select! {
+            read = tokio::time::timeout(READ_DEADLINE, read_bounded_line(&mut reader, &mut line)) => {
+                let complete = read.context("decoded stream read deadline exceeded")??;
+                if !complete {
+                    anyhow::bail!("decoded stream socket closed");
+                }
+                // The boundary: the whole line is readable by a client on the box.
+                let arrival = Instant::now();
+                let wall_ms = now_ms();
+                if let Ok(parsed) = serde_json::from_slice::<DecodedLine>(&line) {
+                    assembly.track_line(parsed, arrival, wall_ms);
+                }
+                line.clear();
+            }
+            reference = ref_rx.recv() => {
+                let Some(reference) = reference else {
+                    anyhow::bail!("peering reference feed ended");
+                };
+                assembly.track_reference(reference);
+            }
+            _ = maintenance.tick() => {}
+        }
+        let (ready, gaps) = assembly.drain_ready(Instant::now());
+        for event in ready {
+            if !sender.send(ProbeEvent::Market(event)).await {
+                reference_task.abort();
+                return Ok(());
+            }
+        }
+        if gaps > 0
+            && !sender
+                .send(ProbeEvent::SequenceGap {
+                    provider: Provider::QuickNodeVpc,
+                    coin: coin.to_owned(),
+                    missing: gaps,
+                })
+                .await
+        {
+            reference_task.abort();
+            return Ok(());
+        }
+    }
+}
+
+/// Append one newline-terminated line to `line` (without the newline). Returns `Ok(false)` at
+/// EOF. Cancel-safe: bytes already moved into `line` stay there, so a caller that drops the
+/// future mid-line and calls again continues the same line. Bounded by `MAX_DECODED_LINE`.
+pub(crate) async fn read_bounded_line(
+    reader: &mut BufReader<TcpStream>,
+    line: &mut Vec<u8>,
+) -> Result<bool> {
+    loop {
+        let (found, consumed) = {
+            let available = reader
+                .fill_buf()
+                .await
+                .context("read decoded stream socket")?;
+            if available.is_empty() {
+                return Ok(false);
+            }
+            match available.iter().position(|&byte| byte == b'\n') {
+                Some(pos) => {
+                    line.extend_from_slice(&available[..pos]);
+                    (true, pos + 1)
+                }
+                None => {
+                    line.extend_from_slice(available);
+                    (false, available.len())
+                }
+            }
+        };
+        reader.consume(consumed);
+        if found {
+            return Ok(true);
+        }
+        if line.len() > MAX_DECODED_LINE {
+            anyhow::bail!(
+                "decoded stream line exceeds {MAX_DECODED_LINE} bytes without a newline: stream desync"
+            );
+        }
+    }
+}
+
+/// Connect the reference feed and parse its NDJSON on a task. Samples cannot close without it,
+/// and its rounds anchor the plausibility window, so every leg opens it first.
+async fn spawn_reference_reader(
+    reference_endpoint: &str,
+) -> Result<(tokio::task::JoinHandle<()>, mpsc::Receiver<ReferenceLine>)> {
+    let reference = TcpStream::connect(reference_endpoint)
+        .await
+        .context("connect peering reference feed")?;
+    let (ref_tx, ref_rx) = mpsc::channel::<ReferenceLine>(4096);
+    let task = tokio::spawn(async move {
+        let mut lines = BufReader::new(reference).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(parsed) = serde_json::from_str::<ReferenceLine>(&line) else {
+                continue;
+            };
+            if ref_tx.send(parsed).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok((task, ref_rx))
+}
+
 /// Drain complete frames from the reassembly buffer, feeding the assembler.
 fn consume_frames(
     buf: &mut Vec<u8>,
@@ -348,27 +876,43 @@ fn consume_frames(
         }
         let kind = buf[offset + 4];
         let body = &buf[offset + 5..offset + total];
-        if kind == 0x01
-            && let Some(payload) = decompress_data_frame(body)
-        {
-            match payload.first() {
-                Some(0x00) => {
-                    for (round, _refs) in ordering_records(&payload, assembly.max_ref_round) {
-                        assembly.track_ordering(round, arrival, wall_ms);
-                    }
+        match kind {
+            0x01 => {
+                if let Some(payload) = decompress_data_frame(body) {
+                    track_payload(&payload, assembly, arrival, wall_ms);
                 }
-                Some(0x01) => {
-                    if let Some(sig) = bundle_first_sig(&payload) {
-                        assembly.track_bundle(sig, arrival, wall_ms);
-                    }
-                }
-                _ => {}
             }
+            // Small bundles travel uncompressed as kind-0 frames whose body is the bundle
+            // payload itself (about 5 % of bundles on mainnet). A round that references one
+            // can only complete if they count; ignoring them made every such round a gap.
+            0x00 if body.first() == Some(&0x01) => {
+                track_payload(body, assembly, arrival, wall_ms);
+            }
+            _ => {}
         }
         offset += total;
     }
     buf.drain(..offset);
     Ok(())
+}
+
+/// One decoded gossip payload: an ordering record set (0x00) or a transaction bundle (0x01).
+fn track_payload(payload: &[u8], assembly: &mut Assembly, arrival: Instant, wall_ms: u64) {
+    match payload.first() {
+        Some(0x00) => {
+            for (round, _refs) in
+                crate::ordering::ordering_rounds(payload, assembly.max_ref_round, ROUND_WINDOW)
+            {
+                assembly.track_ordering(round, arrival, wall_ms);
+            }
+        }
+        Some(0x01) => {
+            if let Some(sig) = bundle_first_sig(payload) {
+                assembly.track_bundle(sig, arrival, wall_ms);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// kind=0x01 body: [u32 LE uncompressed_size][raw LZ4 block].
@@ -381,38 +925,6 @@ fn decompress_data_frame(body: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     lz4_flex::block::decompress(&body[4..], size).ok()
-}
-
-/// Locate ordering records: [proposer 20B][0xfc + u32 LE round][varint count]
-/// [32B bundle_hash x count]. Rounds are only accepted within ROUND_WINDOW of
-/// the reference anchor, which is what makes the scan-based locator sound.
-fn ordering_records(payload: &[u8], anchor_round: u64) -> Vec<(u64, usize)> {
-    let mut out = Vec::new();
-    if anchor_round == 0 {
-        return out;
-    }
-    let mut i = 20usize;
-    while i + 5 <= payload.len() {
-        if payload[i] == 0xFC {
-            let round = u32::from_le_bytes([
-                payload[i + 1],
-                payload[i + 2],
-                payload[i + 3],
-                payload[i + 4],
-            ]) as u64;
-            if round.abs_diff(anchor_round) <= ROUND_WINDOW
-                && let Some((count, next)) = read_bincode_varint(payload, i + 5)
-                && count <= 64
-                && next + 32 * count as usize <= payload.len()
-            {
-                out.push((round, count as usize));
-                i = next + 32 * count as usize;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
 }
 
 /// A bundle payload is [0x01][bincode-varint body_len][~4B prelude]
@@ -552,14 +1064,18 @@ fn parse_reference_time_ms(text: &str) -> Option<u64> {
     u64::try_from(ms).ok()
 }
 
+/// A 32-byte value written as hex, with or without `0x`. The node prints signature values
+/// without leading zeros (a `r` starting with a zero byte is 62 or 63 digits, one bundle in
+/// sixteen), so short input is left-padded; anything longer than 64 digits is not a 32-byte value.
 fn parse_hex32(text: &str) -> Option<[u8; 32]> {
     let hex = text.strip_prefix("0x").unwrap_or(text);
-    if hex.len() != 64 {
+    if hex.is_empty() || hex.len() > 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
+    let padded = format!("{hex:0>64}");
     let mut out = [0u8; 32];
     for (i, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+        *byte = u8::from_str_radix(&padded[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
 }
@@ -591,6 +1107,35 @@ mod tests {
         frame.push(0x01);
         frame.extend_from_slice(&body);
         frame
+    }
+
+    #[test]
+    fn tap_hydromancer_taps_only_the_paid_service_and_dials_quicknode() {
+        let s = PeeringSource::TapHydromancer;
+        assert!(
+            s.taps(Provider::HydromancerPeeringTcp),
+            "the paid service is never dialed"
+        );
+        assert!(!s.taps(Provider::QuickNodePeeringTcp));
+        assert!(PeeringSource::Tap.taps(Provider::QuickNodePeeringTcp));
+        assert!(!PeeringSource::Dial.taps(Provider::HydromancerPeeringTcp));
+    }
+
+    #[test]
+    fn tap_resync_finds_the_first_real_frame_after_joining_mid_stream() {
+        let mut stream = Vec::new();
+        for i in 0..6u8 {
+            stream.extend(lz4_frame(&vec![0x01; 300 + usize::from(i) * 17]));
+        }
+        let first = lz4_frame(&[0x01; 300]).len();
+        // Joined 7 bytes into frame 0: the next boundary is the start of frame 1.
+        assert_eq!(find_frame_boundary(&stream[7..]), Some(first - 7));
+        // Joined exactly on a boundary.
+        assert_eq!(find_frame_boundary(&stream), Some(0));
+        // Not enough frames yet to trust any offset.
+        assert_eq!(find_frame_boundary(&stream[7..first + 40]), None);
+        // Garbage never yields a boundary.
+        assert_eq!(find_frame_boundary(&[0xAB; 4096]), None);
     }
 
     fn ordering_payload(round: u32, bundle_hashes: &[[u8; 32]]) -> Vec<u8> {
@@ -647,6 +1192,93 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn only_rounds_the_chain_produced_can_expire_as_gaps() {
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let t0 = Instant::now();
+        assembly.track_reference(reference_line(
+            2_000_000,
+            "2026-08-10T14:43:15.093322286",
+            &[[0x11; 32]],
+        ));
+        // A round-shaped byte pattern in quorum material: an ordering the reference never names.
+        assembly.track_ordering(2_000_900, t0, 1);
+        // A real round the reference names but the wire never completes.
+        assembly.track_reference(reference_line(
+            2_000_001,
+            "2026-08-10T14:43:15.160000000",
+            &[[0x22; 32]],
+        ));
+        let (ready, gaps) = assembly.drain_ready(t0 + Duration::from_secs(6));
+        assert!(ready.is_empty());
+        assert_eq!(
+            gaps, 2,
+            "2_000_000 and 2_000_001 never completed; 2_000_900 was never a block"
+        );
+        assert_eq!(assembly.drain_ready(t0 + Duration::from_secs(7)).1, 0);
+    }
+
+    #[test]
+    fn reference_hex_without_leading_zeros_still_names_the_32_byte_value() {
+        let full = format!("0x00{}", "ab".repeat(31));
+        let short = format!("0x{}", "ab".repeat(31));
+        assert_eq!(parse_hex32(&full), parse_hex32(&short));
+        assert_eq!(parse_hex32(&full).unwrap()[0], 0);
+        assert_eq!(parse_hex32("0x1").unwrap()[31], 1);
+        assert!(parse_hex32("").is_none());
+        assert!(parse_hex32(&format!("0x{}", "ab".repeat(33))).is_none());
+        assert!(parse_hex32("0xzz").is_none());
+        // A round whose bundle signature the feed printed short must complete like any other.
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let mut sig = [0x66; 32];
+        sig[0] = 0x00;
+        assembly.track_reference(ReferenceLine {
+            r: 1_000_400,
+            t: "2026-08-10T14:43:15.093322286".to_owned(),
+            b: vec![(
+                format!("0x{}", "cd".repeat(32)),
+                Some(format!("0x{}", "66".repeat(31))),
+                1,
+            )],
+        });
+        let t0 = Instant::now();
+        let mut buf = lz4_frame(&ordering_payload(1_000_400, &[[0xcd; 32]]));
+        buf.extend_from_slice(&lz4_frame(&bundle_payload(&[&record_with_sig(sig)])));
+        consume_frames(&mut buf, &mut assembly, t0, 1).unwrap();
+        let (ready, gaps) = assembly.drain_ready(t0);
+        assert_eq!((ready.len(), gaps), (1, 0));
+    }
+
+    #[test]
+    fn an_uncompressed_kind0_bundle_frame_completes_its_round() {
+        let mut assembly = Assembly::new(Provider::QuickNodePeeringTcp, "BLOCKS".to_owned());
+        let sig = [0x55; 32];
+        assembly.track_reference(reference_line(
+            1_000_300,
+            "2026-08-10T14:43:15.093322286",
+            &[sig],
+        ));
+        let t0 = Instant::now();
+        let mut buf = lz4_frame(&ordering_payload(1_000_300, &[[0xab; 32]]));
+        // The bundle arrives as a kind-0 frame whose body is the raw bundle payload.
+        let raw = bundle_payload(&[&record_with_sig(sig)]);
+        buf.extend_from_slice(&(raw.len() as u32).to_be_bytes());
+        buf.push(0x00);
+        buf.extend_from_slice(&raw);
+        // A kind-0 control frame (body not starting 0x01) is still ignored.
+        buf.extend_from_slice(&[0, 0, 0, 1, 0x00, 0x03]);
+        consume_frames(&mut buf, &mut assembly, t0, 7).unwrap();
+        assert!(buf.is_empty());
+        let (ready, gaps) = assembly.drain_ready(t0);
+        assert_eq!(gaps, 0);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(
+            ready[0].key.content,
+            ContentKey::Peering { round: 1_000_300 }
+        );
+        assert_eq!(ready[0].received_wall_ms, 7);
     }
 
     #[test]
@@ -776,5 +1408,169 @@ mod tests {
             Some(1_786_372_995_093)
         );
         assert!(parse_reference_time_ms("not a time").is_none());
+    }
+}
+
+#[cfg(test)]
+mod decoded_tests {
+    use super::*;
+
+    fn hex32(byte: u8) -> String {
+        format!("0x{}", format!("{byte:02x}").repeat(32))
+    }
+
+    fn reference(round: u64, time: &str, hashes: &[u8]) -> ReferenceLine {
+        ReferenceLine {
+            r: round,
+            t: time.to_owned(),
+            b: hashes
+                .iter()
+                .map(|byte| (hex32(*byte), Some(hex32(0xee)), 1u64))
+                .collect(),
+        }
+    }
+
+    fn block_line(kind: &str, round: u64, complete: bool, hashes: &[u8]) -> DecodedLine {
+        let bundles = hashes
+            .iter()
+            .map(|byte| {
+                format!(
+                    "[\"{}\",{{\"first_recv_ns\":1,\"copies\":2,\"raw_frame\":false,\"signed_actions\":[{{\"action\":{{\"type\":\"noop\"}}}}]}}]",
+                    hex32(*byte)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            "{{\"type\":\"{kind}\",\"round\":{round},\"parent_round\":{},\"proposer\":\"0x00\",\"relay_recv_ns\":1,\"emit_ns\":2,\"lane\":3,\"complete\":{complete},\"missing\":[],\"signed_action_bundles\":[{bundles}]}}",
+            round - 1
+        );
+        serde_json::from_str(&json).expect("decoded block line parses")
+    }
+
+    #[test]
+    fn a_complete_block_line_with_the_chains_bundle_set_is_the_vpc_sample() {
+        let mut assembly = DecodedAssembly::new("BLOCKS".to_owned());
+        let t0 = Instant::now();
+        // Lines before the reference anchor are not tracked (same window rule as the wire).
+        assembly.track_line(block_line("block", 500, true, &[0x11]), t0, 1_000);
+        assembly.track_reference(reference(500, "2026-08-10T14:43:15.093322286", &[0x11]));
+        let (ready, gaps) = assembly.drain_ready(t0);
+        assert!(ready.is_empty());
+        assert_eq!(gaps, 0);
+
+        assembly.track_line(
+            block_line("block", 500, true, &[0x11]),
+            t0 + Duration::from_millis(80),
+            1_080,
+        );
+        let (ready, gaps) = assembly.drain_ready(t0 + Duration::from_millis(81));
+        assert_eq!(gaps, 0);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].provider, Provider::QuickNodeVpc);
+        assert_eq!(ready[0].key.event_ms, 1_786_372_995_093);
+        assert_eq!(ready[0].key.content, ContentKey::Peering { round: 500 });
+        assert_eq!(ready[0].received, t0 + Duration::from_millis(80));
+        assert_eq!(ready[0].received_wall_ms, 1_080);
+        // One sample per round; a re-served line never produces a second one.
+        assembly.track_line(block_line("block", 500, true, &[0x11]), t0, 1_000);
+        assert!(
+            assembly
+                .drain_ready(t0 + Duration::from_secs(1))
+                .0
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bundle_order_does_not_matter_but_the_set_must_match() {
+        let mut assembly = DecodedAssembly::new("BLOCKS".to_owned());
+        let t0 = Instant::now();
+        assembly.track_reference(reference(
+            600,
+            "2026-08-10T14:43:15.093322286",
+            &[0x11, 0x22],
+        ));
+        assembly.track_reference(reference(601, "2026-08-10T14:43:15.160000000", &[0x33]));
+        assembly.track_line(block_line("block", 600, true, &[0x22, 0x11]), t0, 1);
+        assembly.track_line(block_line("block", 601, true, &[0x44]), t0, 2);
+        let (ready, gaps) = assembly.drain_ready(t0);
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].key.content, ContentKey::Peering { round: 600 });
+        // A block that is not the chain's block is a gap, counted once, never a sample.
+        assert_eq!(gaps, 1);
+        assert_eq!(assembly.drain_ready(t0 + Duration::from_secs(10)).1, 0);
+    }
+
+    #[test]
+    fn an_incomplete_proposal_is_timed_at_its_patch_or_expires_as_a_gap() {
+        let mut assembly = DecodedAssembly::new("BLOCKS".to_owned());
+        let t0 = Instant::now();
+        assembly.track_reference(reference(700, "2026-08-10T14:43:15.093322286", &[0x11]));
+        assembly.track_reference(reference(701, "2026-08-10T14:43:15.160000000", &[0x22]));
+        assembly.track_line(block_line("block", 700, false, &[]), t0, 1);
+        assembly.track_line(block_line("block", 701, false, &[]), t0, 1);
+        assert!(
+            assembly
+                .drain_ready(t0 + Duration::from_secs(1))
+                .0
+                .is_empty()
+        );
+        assembly.track_line(
+            block_line("block_patch", 700, true, &[0x11]),
+            t0 + Duration::from_millis(300),
+            301,
+        );
+        let (ready, gaps) = assembly.drain_ready(t0 + Duration::from_secs(2));
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].received, t0 + Duration::from_millis(300));
+        assert_eq!(gaps, 0);
+        // 701 never completed within the deadline: one gap, once.
+        assert_eq!(assembly.drain_ready(t0 + Duration::from_secs(6)).1, 1);
+        assert_eq!(assembly.drain_ready(t0 + Duration::from_secs(7)).1, 0);
+    }
+
+    #[test]
+    fn commit_skip_and_orphan_lines_are_not_samples() {
+        let mut assembly = DecodedAssembly::new("BLOCKS".to_owned());
+        let t0 = Instant::now();
+        assembly.track_reference(reference(800, "2026-08-10T14:43:15.093322286", &[]));
+        for kind in ["commit", "skip", "orphan"] {
+            let line: DecodedLine = serde_json::from_str(&format!(
+                "{{\"type\":\"{kind}\",\"round\":800,\"relay_recv_ns\":1,\"emit_ns\":2,\"lane\":3}}"
+            ))
+            .unwrap();
+            assembly.track_line(line, t0, 1);
+        }
+        assert!(assembly.drain_ready(t0).0.is_empty());
+        // An empty block (no bundles) still needs its `block` line to be a sample.
+        assembly.track_line(block_line("block", 800, true, &[]), t0, 1);
+        assert_eq!(assembly.drain_ready(t0).0.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_returns_whole_lines_and_survives_split_reads() {
+        use tokio::io::AsyncWriteExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            socket.write_all(b"{\"a\":1}\n{\"b\":").await.unwrap();
+            socket.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            socket.write_all(b"2}\n").await.unwrap();
+            socket.shutdown().await.unwrap();
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = Vec::new();
+        assert!(read_bounded_line(&mut reader, &mut line).await.unwrap());
+        assert_eq!(line, b"{\"a\":1}");
+        line.clear();
+        assert!(read_bounded_line(&mut reader, &mut line).await.unwrap());
+        assert_eq!(line, b"{\"b\":2}");
+        line.clear();
+        assert!(!read_bounded_line(&mut reader, &mut line).await.unwrap());
+        writer.await.unwrap();
     }
 }
