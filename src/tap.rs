@@ -278,6 +278,7 @@ mod linux {
 
     const ETH_P_IP: u16 = 0x0800;
     const PACKET_OUTGOING: u8 = 4;
+    const ARPHRD_LOOPBACK: u16 = 772;
 
     /// Open a read-only capture socket filtered in the kernel to `src:src_port` and forward each
     /// segment on `tx` from a dedicated thread. Needs CAP_NET_RAW; sends nothing.
@@ -378,8 +379,11 @@ mod linux {
                         warn!(?e, "peering tap capture failed");
                         break;
                     }
-                    // Loopback shows each packet twice (out + in): keep the receive copy only.
-                    if addr.sll_pkttype == PACKET_OUTGOING {
+                    // Loopback shows each packet twice (out + in): keep the receive copy there.
+                    // Elsewhere keep outgoing copies too: a node in a container behind a bridge
+                    // receives what the host FORWARDS, which the host sees only as outgoing (the
+                    // bridge + veth duplicates are dropped by the reassembler as retransmits).
+                    if addr.sll_pkttype == PACKET_OUTGOING && addr.sll_hatype == ARPHRD_LOOPBACK {
                         continue;
                     }
                     let wall_ns = kernel_timestamp(&msg).unwrap_or_else(now_ns);

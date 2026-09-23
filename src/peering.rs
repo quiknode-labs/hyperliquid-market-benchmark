@@ -89,6 +89,10 @@ struct Assembly {
     bundles: HashMap<[u8; 32], (Instant, u64, Instant)>,
     max_ref_round: u64,
     emitted_high_water: u64,
+    /// Why rounds the chain produced did not complete (logged by the tap; see `gap_reasons`).
+    gaps_no_ordering: u64,
+    gaps_missing_bundle: u64,
+    completed: u64,
 }
 
 impl Assembly {
@@ -100,6 +104,9 @@ impl Assembly {
             bundles: HashMap::new(),
             max_ref_round: 0,
             emitted_high_water: 0,
+            gaps_no_ordering: 0,
+            gaps_missing_bundle: 0,
+            completed: 0,
         }
     }
 
@@ -168,6 +175,7 @@ impl Assembly {
                     // chain produced and the wire did not complete is a gap.
                     if tracked.reference.is_some() {
                         expired_gaps += 1;
+                        self.gaps_no_ordering += 1;
                     }
                 }
                 continue;
@@ -196,10 +204,12 @@ impl Assembly {
                 {
                     tracked.reported_gap = true;
                     expired_gaps += 1;
+                    self.gaps_missing_bundle += 1;
                 }
                 continue;
             }
             tracked.reported_gap = true; // completed; never revisit
+            self.completed += 1;
             ready.push(MarketEvent {
                 provider: self.provider,
                 key: EventKey {
@@ -385,18 +395,34 @@ async fn run_peering_tap_once(
     let mut maintenance = tokio::time::interval(Duration::from_millis(100));
     let mut last_bytes = Instant::now();
     let mut resets = 0u64;
+    let mut tapped_bytes = 0u64;
+    let mut segments = 0u64;
+    let mut health = tokio::time::interval(Duration::from_secs(60));
+    health.tick().await;
 
     loop {
         let mut deliveries = Vec::new();
         tokio::select! {
             seg = seg_rx.recv() => {
                 let Some(seg) = seg else { anyhow::bail!("peering tap capture stopped") };
+                segments += 1;
                 let flow = flows.entry(seg.dst_port).or_default();
                 deliveries.push((seg.dst_port, flow.reassembler.push(seg, Instant::now())));
             }
             line = ref_rx.recv() => {
                 let Some(line) = line else { anyhow::bail!("peering reference feed ended") };
                 assembly.track_reference(line);
+            }
+            _ = health.tick() => {
+                // One line a minute: what the tap saw and why rounds did or did not complete.
+                tracing::info!(
+                    %endpoint, flows = flows.len(), segments, tapped_bytes, resets,
+                    completed = assembly.completed,
+                    gaps_no_ordering = assembly.gaps_no_ordering,
+                    gaps_missing_bundle = assembly.gaps_missing_bundle,
+                    tracked_bundles = assembly.bundles.len(),
+                    "peering tap health"
+                );
             }
             _ = maintenance.tick() => {
                 let now = Instant::now();
@@ -420,6 +446,7 @@ async fn run_peering_tap_once(
                     }
                     crate::tap::Delivery::Bytes { data, wall_ns } => {
                         last_bytes = Instant::now();
+                        tapped_bytes += data.len() as u64;
                         flow.buf.extend_from_slice(&data);
                         // Kernel receive time -> the monotonic clock the assembly uses.
                         let wall_ms = wall_ns / 1_000_000;
