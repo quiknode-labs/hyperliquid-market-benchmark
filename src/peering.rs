@@ -885,7 +885,9 @@ fn consume_frames(
 fn track_payload(payload: &[u8], assembly: &mut Assembly, arrival: Instant, wall_ms: u64) {
     match payload.first() {
         Some(0x00) => {
-            for (round, _refs) in ordering_records(payload, assembly.max_ref_round) {
+            for (round, _refs) in
+                crate::ordering::ordering_rounds(payload, assembly.max_ref_round, ROUND_WINDOW)
+            {
                 assembly.track_ordering(round, arrival, wall_ms);
             }
         }
@@ -908,38 +910,6 @@ fn decompress_data_frame(body: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     lz4_flex::block::decompress(&body[4..], size).ok()
-}
-
-/// Locate ordering records: [proposer 20B][0xfc + u32 LE round][varint count]
-/// [32B bundle_hash x count]. Rounds are only accepted within ROUND_WINDOW of
-/// the reference anchor, which is what makes the scan-based locator sound.
-fn ordering_records(payload: &[u8], anchor_round: u64) -> Vec<(u64, usize)> {
-    let mut out = Vec::new();
-    if anchor_round == 0 {
-        return out;
-    }
-    let mut i = 20usize;
-    while i + 5 <= payload.len() {
-        if payload[i] == 0xFC {
-            let round = u32::from_le_bytes([
-                payload[i + 1],
-                payload[i + 2],
-                payload[i + 3],
-                payload[i + 4],
-            ]) as u64;
-            if round.abs_diff(anchor_round) <= ROUND_WINDOW
-                && let Some((count, next)) = read_bincode_varint(payload, i + 5)
-                && count <= 64
-                && next + 32 * count as usize <= payload.len()
-            {
-                out.push((round, count as usize));
-                i = next + 32 * count as usize;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
 }
 
 /// A bundle payload is [0x01][bincode-varint body_len][~4B prelude]

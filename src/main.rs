@@ -17,6 +17,7 @@ mod benchmark;
 mod clock;
 mod grpc;
 mod model;
+mod ordering;
 mod peering;
 mod streams;
 mod tap;
