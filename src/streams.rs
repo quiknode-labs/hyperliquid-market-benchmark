@@ -52,6 +52,8 @@ pub struct StreamConfig {
     /// rows. Ignored by every other dataset.
     pub peering_endpoints: Vec<(Provider, String)>,
     pub peering_reference: String,
+    /// Dial each peering endpoint, or tap the node's existing connection to it.
+    pub peering_source: crate::peering::PeeringSource,
     /// `hl/data` of the Hyperliquid node on THIS box (the Quicknode VPC product). When set for
     /// the fills dataset, the node's own `node_fills_by_block` output is the only source: the
     /// same per-user fill pairs the Quicknode gRPC feed carries, reconstructed with the same
@@ -153,13 +155,22 @@ pub fn spawn_streams(config: StreamConfig, sender: ProbeSender) -> Vec<JoinHandl
         }
         if config.dataset == Dataset::Peering {
             for (provider, endpoint) in &config.peering_endpoints {
-                tasks.push(tokio::spawn(crate::peering::run_peering(
+                let args = (
                     *provider,
                     endpoint.clone(),
                     config.peering_reference.clone(),
                     coin.clone(),
                     sender.clone(),
-                )));
+                );
+                tasks.push(if config.peering_source.taps(*provider) {
+                    tokio::spawn(crate::peering::run_peering_tap(
+                        args.0, args.1, args.2, args.3, args.4,
+                    ))
+                } else {
+                    tokio::spawn(crate::peering::run_peering(
+                        args.0, args.1, args.2, args.3, args.4,
+                    ))
+                });
             }
             if let Some(socket) = &config.vpc_decoded_socket {
                 tasks.push(tokio::spawn(crate::peering::run_vpc_decoded(

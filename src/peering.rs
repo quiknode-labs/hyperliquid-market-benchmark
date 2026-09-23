@@ -89,6 +89,10 @@ struct Assembly {
     bundles: HashMap<[u8; 32], (Instant, u64, Instant)>,
     max_ref_round: u64,
     emitted_high_water: u64,
+    /// Why rounds the chain produced did not complete (logged by the tap; see `gap_reasons`).
+    gaps_no_ordering: u64,
+    gaps_missing_bundle: u64,
+    completed: u64,
 }
 
 impl Assembly {
@@ -100,6 +104,9 @@ impl Assembly {
             bundles: HashMap::new(),
             max_ref_round: 0,
             emitted_high_water: 0,
+            gaps_no_ordering: 0,
+            gaps_missing_bundle: 0,
+            completed: 0,
         }
     }
 
@@ -168,6 +175,7 @@ impl Assembly {
                     // chain produced and the wire did not complete is a gap.
                     if tracked.reference.is_some() {
                         expired_gaps += 1;
+                        self.gaps_no_ordering += 1;
                     }
                 }
                 continue;
@@ -196,10 +204,12 @@ impl Assembly {
                 {
                     tracked.reported_gap = true;
                     expired_gaps += 1;
+                    self.gaps_missing_bundle += 1;
                 }
                 continue;
             }
             tracked.reported_gap = true; // completed; never revisit
+            self.completed += 1;
             ready.push(MarketEvent {
                 provider: self.provider,
                 key: EventKey {
@@ -221,6 +231,30 @@ impl Assembly {
         self.rounds.retain(|round, _| *round >= floor);
         self.bundles
             .retain(|_, (_, _, seen)| now.duration_since(*seen) < BUNDLE_RETAIN);
+    }
+}
+
+/// Where the peering dataset's bytes come from (`--peering-source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum PeeringSource {
+    /// Open our own subscription to the endpoint.
+    Dial,
+    /// Read the connection the node on this box already holds to the endpoint (`tap.rs`).
+    Tap,
+    /// Tap the Hydromancer endpoint (the box's node is that service's paying customer, so a
+    /// second subscription would be billed egress) and dial the Quicknode one: one process, one
+    /// box, one clock, one exact two-source cohort, and the paid service still sends one stream.
+    TapHydromancer,
+}
+
+impl PeeringSource {
+    /// Whether `provider`'s endpoint is read from the node's existing connection.
+    pub fn taps(self, provider: Provider) -> bool {
+        match self {
+            Self::Dial => false,
+            Self::Tap => true,
+            Self::TapHydromancer => provider == Provider::HydromancerPeeringTcp,
+        }
     }
 }
 
@@ -316,6 +350,215 @@ async fn run_peering_once(
             return Ok(());
         }
     }
+}
+
+/// TAP source (see `tap.rs`): the same assembly as [`run_peering`], fed from the connection a
+/// node on this box already holds to `endpoint` instead of a second subscription. Sends nothing
+/// to the service.
+pub async fn run_peering_tap(
+    provider: Provider,
+    endpoint: String,
+    reference_endpoint: String,
+    coin: String,
+    sender: ProbeSender,
+) {
+    let mut backoff = ReconnectBackoff::default();
+    loop {
+        let started = Instant::now();
+        match run_peering_tap_once(provider, &endpoint, &reference_endpoint, &coin, &sender).await {
+            Ok(()) => warn!(%coin, "peering tap ended"),
+            Err(error) => warn!(%coin, ?error, "peering tap failed"),
+        }
+        if !sender
+            .send(ProbeEvent::Reconnect {
+                provider,
+                coin: coin.clone(),
+            })
+            .await
+        {
+            return;
+        }
+        tokio::time::sleep(backoff.after_connection(started.elapsed())).await;
+    }
+}
+
+/// One byte stream per tapped connection (local port), each resynchronised independently.
+#[derive(Default)]
+struct TapFlow {
+    reassembler: crate::tap::Reassembler,
+    buf: Vec<u8>,
+    synced: bool,
+}
+
+async fn run_peering_tap_once(
+    provider: Provider,
+    endpoint: &str,
+    reference_endpoint: &str,
+    coin: &str,
+    sender: &ProbeSender,
+) -> Result<()> {
+    let addr: std::net::SocketAddrV4 = endpoint.parse().context(
+        "peering tap endpoint must be an IPv4 ip:port (the peer the node is connected to)",
+    )?;
+    let (reference_task, mut ref_rx) = spawn_reference_reader(reference_endpoint).await?;
+    let (seg_tx, mut seg_rx) = mpsc::channel::<crate::tap::Segment>(65_536);
+    let _capture = crate::tap::spawn_capture(*addr.ip(), addr.port(), seg_tx)?;
+    let _connection = sender.connected(provider, coin);
+
+    let mut assembly = Assembly::new(provider, coin.to_owned());
+    let mut flows: HashMap<u16, TapFlow> = HashMap::new();
+    let mut maintenance = tokio::time::interval(Duration::from_millis(100));
+    let mut last_bytes = Instant::now();
+    let mut resets = 0u64;
+    let mut tapped_bytes = 0u64;
+    let mut segments = 0u64;
+    let mut health = tokio::time::interval(Duration::from_secs(60));
+    health.tick().await;
+
+    loop {
+        let mut deliveries = Vec::new();
+        tokio::select! {
+            seg = seg_rx.recv() => {
+                let Some(seg) = seg else { anyhow::bail!("peering tap capture stopped") };
+                segments += 1;
+                let flow = flows.entry(seg.dst_port).or_default();
+                deliveries.push((seg.dst_port, flow.reassembler.push(seg, Instant::now())));
+            }
+            line = ref_rx.recv() => {
+                let Some(line) = line else { anyhow::bail!("peering reference feed ended") };
+                assembly.track_reference(line);
+            }
+            _ = health.tick() => {
+                // One line a minute: what the tap saw and why rounds did or did not complete.
+                tracing::info!(
+                    %endpoint, flows = flows.len(), segments, tapped_bytes, resets,
+                    completed = assembly.completed,
+                    gaps_no_ordering = assembly.gaps_no_ordering,
+                    gaps_missing_bundle = assembly.gaps_missing_bundle,
+                    tracked_bundles = assembly.bundles.len(),
+                    "peering tap health"
+                );
+            }
+            _ = maintenance.tick() => {
+                let now = Instant::now();
+                for (port, flow) in flows.iter_mut() {
+                    deliveries.push((*port, flow.reassembler.tick(now)));
+                }
+                if now.duration_since(last_bytes) > READ_DEADLINE {
+                    anyhow::bail!("no tapped bytes from {endpoint} for {READ_DEADLINE:?}: is a node on this box connected to it?");
+                }
+            }
+        }
+        for (port, out) in deliveries {
+            let flow = flows.get_mut(&port).expect("flow exists");
+            for delivery in out {
+                match delivery {
+                    crate::tap::Delivery::Reset { reason } => {
+                        resets += 1;
+                        warn!(%endpoint, port, reason, resets, "peering tap stream reset; resynchronising");
+                        flow.buf.clear();
+                        flow.synced = false;
+                    }
+                    crate::tap::Delivery::Bytes { data, wall_ns } => {
+                        last_bytes = Instant::now();
+                        tapped_bytes += data.len() as u64;
+                        flow.buf.extend_from_slice(&data);
+                        // Kernel receive time -> the monotonic clock the assembly uses.
+                        let wall_ms = wall_ns / 1_000_000;
+                        let behind = now_ms().saturating_sub(wall_ms);
+                        let arrival = Instant::now()
+                            .checked_sub(Duration::from_millis(behind))
+                            .unwrap_or_else(Instant::now);
+                        if !flow.synced {
+                            match find_frame_boundary(&flow.buf) {
+                                Some(offset) => {
+                                    flow.buf.drain(..offset);
+                                    flow.synced = true;
+                                }
+                                None => {
+                                    // Keep the tail only: a boundary lies within one max frame.
+                                    let keep = (MAX_FRAME_BODY as usize + 5) * 2;
+                                    if flow.buf.len() > keep {
+                                        let cut = flow.buf.len() - keep;
+                                        flow.buf.drain(..cut);
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        if let Err(error) =
+                            consume_frames(&mut flow.buf, &mut assembly, arrival, wall_ms)
+                        {
+                            warn!(%endpoint, port, ?error, "peering tap desync; resynchronising");
+                            flow.buf.clear();
+                            flow.synced = false;
+                        }
+                    }
+                }
+            }
+        }
+        let (ready, expired) = assembly.drain_ready(Instant::now());
+        for event in ready {
+            if !sender.send(ProbeEvent::Market(event)).await {
+                reference_task.abort();
+                return Ok(());
+            }
+        }
+        if expired > 0
+            && !sender
+                .send(ProbeEvent::SequenceGap {
+                    provider,
+                    coin: coin.to_owned(),
+                    missing: expired,
+                })
+                .await
+        {
+            reference_task.abort();
+            return Ok(());
+        }
+    }
+}
+
+/// Frames needed in a row before a byte offset is trusted as a boundary after joining mid-stream.
+const RESYNC_FRAMES: usize = 4;
+
+/// First offset in `buf` where RESYNC_FRAMES consecutive well-formed frames start, at least one of
+/// them a kind-1 frame that decompresses. None if `buf` does not yet hold enough bytes to decide.
+fn find_frame_boundary(buf: &[u8]) -> Option<usize> {
+    'start: for start in 0..buf.len().saturating_sub(5) {
+        let mut offset = start;
+        let mut decoded = false;
+        for _ in 0..RESYNC_FRAMES {
+            if buf.len() - offset < 5 {
+                continue 'start;
+            }
+            let body_len = u32::from_be_bytes([
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            ]);
+            let kind = buf[offset + 4];
+            if body_len == 0 || body_len > MAX_FRAME_BODY || kind > 1 {
+                continue 'start;
+            }
+            let total = 5 + body_len as usize;
+            if buf.len() - offset < total {
+                continue 'start;
+            }
+            if kind == 1 {
+                if decompress_data_frame(&buf[offset + 5..offset + total]).is_none() {
+                    continue 'start;
+                }
+                decoded = true;
+            }
+            offset += total;
+        }
+        if decoded {
+            return Some(start);
+        }
+    }
+    None
 }
 
 /// Longest decoded line accepted from the sentry socket. A 2 000-action block serialises to a
@@ -657,7 +900,9 @@ fn consume_frames(
 fn track_payload(payload: &[u8], assembly: &mut Assembly, arrival: Instant, wall_ms: u64) {
     match payload.first() {
         Some(0x00) => {
-            for (round, _refs) in ordering_records(payload, assembly.max_ref_round) {
+            for (round, _refs) in
+                crate::ordering::ordering_rounds(payload, assembly.max_ref_round, ROUND_WINDOW)
+            {
                 assembly.track_ordering(round, arrival, wall_ms);
             }
         }
@@ -680,38 +925,6 @@ fn decompress_data_frame(body: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     lz4_flex::block::decompress(&body[4..], size).ok()
-}
-
-/// Locate ordering records: [proposer 20B][0xfc + u32 LE round][varint count]
-/// [32B bundle_hash x count]. Rounds are only accepted within ROUND_WINDOW of
-/// the reference anchor, which is what makes the scan-based locator sound.
-fn ordering_records(payload: &[u8], anchor_round: u64) -> Vec<(u64, usize)> {
-    let mut out = Vec::new();
-    if anchor_round == 0 {
-        return out;
-    }
-    let mut i = 20usize;
-    while i + 5 <= payload.len() {
-        if payload[i] == 0xFC {
-            let round = u32::from_le_bytes([
-                payload[i + 1],
-                payload[i + 2],
-                payload[i + 3],
-                payload[i + 4],
-            ]) as u64;
-            if round.abs_diff(anchor_round) <= ROUND_WINDOW
-                && let Some((count, next)) = read_bincode_varint(payload, i + 5)
-                && count <= 64
-                && next + 32 * count as usize <= payload.len()
-            {
-                out.push((round, count as usize));
-                i = next + 32 * count as usize;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    out
 }
 
 /// A bundle payload is [0x01][bincode-varint body_len][~4B prelude]
@@ -894,6 +1107,35 @@ mod tests {
         frame.push(0x01);
         frame.extend_from_slice(&body);
         frame
+    }
+
+    #[test]
+    fn tap_hydromancer_taps_only_the_paid_service_and_dials_quicknode() {
+        let s = PeeringSource::TapHydromancer;
+        assert!(
+            s.taps(Provider::HydromancerPeeringTcp),
+            "the paid service is never dialed"
+        );
+        assert!(!s.taps(Provider::QuickNodePeeringTcp));
+        assert!(PeeringSource::Tap.taps(Provider::QuickNodePeeringTcp));
+        assert!(!PeeringSource::Dial.taps(Provider::HydromancerPeeringTcp));
+    }
+
+    #[test]
+    fn tap_resync_finds_the_first_real_frame_after_joining_mid_stream() {
+        let mut stream = Vec::new();
+        for i in 0..6u8 {
+            stream.extend(lz4_frame(&vec![0x01; 300 + usize::from(i) * 17]));
+        }
+        let first = lz4_frame(&[0x01; 300]).len();
+        // Joined 7 bytes into frame 0: the next boundary is the start of frame 1.
+        assert_eq!(find_frame_boundary(&stream[7..]), Some(first - 7));
+        // Joined exactly on a boundary.
+        assert_eq!(find_frame_boundary(&stream), Some(0));
+        // Not enough frames yet to trust any offset.
+        assert_eq!(find_frame_boundary(&stream[7..first + 40]), None);
+        // Garbage never yields a boundary.
+        assert_eq!(find_frame_boundary(&[0xAB; 4096]), None);
     }
 
     fn ordering_payload(round: u32, bundle_hashes: &[[u8; 32]]) -> Vec<u8> {
